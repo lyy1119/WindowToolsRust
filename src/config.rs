@@ -33,7 +33,14 @@ pub struct Config {
     pub auto_frame_on_pick: bool,
     /// 窗口置顶时是否自动给它标记红框（取消置顶时会自动移除这个自动加上的红框）
     pub auto_frame_on_topmost: bool,
-    /// 全局快捷键（格式如 `Ctrl+Alt+T`，键名可用 `T` 或 `KeyT`）
+    /// 点关闭按钮时是否只把窗口隐藏到托盘，而不是退出程序
+    pub close_to_tray: bool,
+    /// 指定中文字体文件（绝对路径，或 %WINDIR%\Fonts 下的文件名）。
+    /// **留空 = 自动按优先级挑选**（微软雅黑 → 等线 → 黑体 → 宋体 …）。
+    /// 中文字体是内存占用的大头，换成更小的字体会明显降低内存。
+    pub font_file: String,
+    /// 全局快捷键（格式如 `Ctrl+Alt+T`，键名可用 `T` 或 `KeyT`）。
+    /// **留空表示不注册该快捷键。**
     pub hotkey_pick: String,
     pub hotkey_frame: String,
     pub hotkey_topmost: String,
@@ -52,6 +59,8 @@ impl Default for Config {
             inject_system_menu: true,
             auto_frame_on_pick: true,
             auto_frame_on_topmost: true,
+            close_to_tray: true,
+            font_file: String::new(),
             hotkey_pick: "Ctrl+Alt+P".to_string(),
             hotkey_frame: "Ctrl+Alt+F".to_string(),
             hotkey_topmost: "Ctrl+Alt+T".to_string(),

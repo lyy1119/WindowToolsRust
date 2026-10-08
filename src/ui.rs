@@ -23,15 +23,25 @@ pub struct UiState {
     pub auto_frame_on_pick: bool,
     /// 置顶时自动给窗口标记红框
     pub auto_frame_on_topmost: bool,
+    /// 关闭窗口时隐藏到托盘而不是退出
+    pub close_to_tray: bool,
+    pub font_file: String,
     pub inject_system_menu: bool,
     pub hotkey_pick: String,
     pub hotkey_frame: String,
     pub hotkey_topmost: String,
     pub hotkey_mute: String,
+    /// 日志尾部缓存：只在日志版本变化时重建，避免每帧克隆（性能）
+    pub log_tail: Vec<String>,
+    pub log_rev: u64,
+    /// 音频快照缓存：同样只在版本变化时更换（性能）
+    pub audio: crate::win::audio::AudioSnapshot,
+    /// 配置文件路径，开机读一次就够
+    pub config_path: String,
 }
 
 impl UiState {
-    pub fn new(cfg: &Config) -> Self {
+    pub fn new(cfg: &Config, config_path: String) -> Self {
         Self {
             windows: Vec::new(),
             pick_idx: 0,
@@ -47,11 +57,17 @@ impl UiState {
             restore_before_resize: cfg.restore_before_resize,
             auto_frame_on_pick: cfg.auto_frame_on_pick,
             auto_frame_on_topmost: cfg.auto_frame_on_topmost,
+            close_to_tray: cfg.close_to_tray,
+            font_file: cfg.font_file.clone(),
             inject_system_menu: cfg.inject_system_menu,
             hotkey_pick: cfg.hotkey_pick.clone(),
             hotkey_frame: cfg.hotkey_frame.clone(),
             hotkey_topmost: cfg.hotkey_topmost.clone(),
             hotkey_mute: cfg.hotkey_mute.clone(),
+            log_tail: Vec::new(),
+            log_rev: u64::MAX,
+            audio: Default::default(),
+            config_path,
         }
     }
 
@@ -63,6 +79,8 @@ impl UiState {
         cfg.restore_before_resize = self.restore_before_resize;
         cfg.auto_frame_on_pick = self.auto_frame_on_pick;
         cfg.auto_frame_on_topmost = self.auto_frame_on_topmost;
+        cfg.close_to_tray = self.close_to_tray;
+        cfg.font_file = self.font_file.trim().to_string();
         cfg.inject_system_menu = self.inject_system_menu;
         cfg.hotkey_pick = self.hotkey_pick.trim().to_string();
         cfg.hotkey_frame = self.hotkey_frame.trim().to_string();
@@ -76,11 +94,9 @@ impl UiState {
 struct Snapshot {
     target: Option<TargetWindow>,
     frame_on: bool,
-    audio: crate::win::audio::AudioSnapshot,
-    log_tail: Vec<String>,
     topmost: bool,
     resizable: bool,
-    config_path: String,
+    elevated: bool,
 }
 
 fn snapshot(state: &Shared) -> Snapshot {
@@ -94,19 +110,24 @@ fn snapshot(state: &Shared) -> Snapshot {
         .as_ref()
         .map(|t| window::is_resizable(crate::win::hwnd(t.hwnd)))
         .unwrap_or(false);
-    let log_tail = st.log.iter().rev().take(200).rev().cloned().collect();
     Snapshot {
         target,
         frame_on: st.frame_on,
-        audio: st.audio_snapshot.clone(),
-        log_tail,
         topmost,
         resizable,
-        config_path: st.config_path.display().to_string(),
+        elevated: st.elevated,
     }
 }
 
 pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
+    // 整个界面套一层竖向滚动区域：窗口高度不够（或内容变多）时可以滚动查看，
+    // 不会出现「下面的设置看不见也够不着」。
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| draw_inner(ui, state, s));
+}
+
+fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
     let snap = snapshot(state);
     let mut toast: Option<String> = None;
 
@@ -116,6 +137,45 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
             .small()
             .weak(),
     );
+
+    // 权限提示：没提权的话，操作管理员权限的窗口会静默失败
+    if !snap.elevated {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("⚠ 当前未以管理员身份运行")
+                    .color(egui::Color32::from_rgb(230, 170, 60))
+                    .strong(),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "—— 无法操作以管理员权限运行的窗口（如任务管理器）。",
+                )
+                .small()
+                .weak(),
+            );
+            if ui.button("以管理员身份重启").clicked() {
+                match crate::win::privilege::restart_as_admin() {
+                    Ok(()) => {
+                        {
+                            let mut st = state.lock();
+                            // 有这个标记，关闭请求才不会被「最小化到托盘」拦下来
+                            st.pending_quit = true;
+                            st.log("已请求提权，本进程即将退出");
+                        }
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(e) => toast = Some(format!("提权失败: {e:#}")),
+                }
+            }
+        });
+    } else {
+        ui.label(
+            egui::RichText::new("✓ 已以管理员身份运行")
+                .small()
+                .color(egui::Color32::from_rgb(120, 200, 120)),
+        );
+    }
+
     ui.separator();
 
     // ---------- 目标窗口 ----------
@@ -208,7 +268,7 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
             toast = Some(report(actions::toggle_topmost(state)));
         }
 
-        let mute_label = match snap.audio.muted {
+        let mute_label = match s.audio.muted {
             Some(true) => "🔇 取消静音",
             _ => "🔇 静音",
         };
@@ -217,25 +277,49 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
         }
     });
 
-    // 静音状态说明
-    match (&snap.audio.error, snap.audio.muted, snap.audio.session_count) {
-        (Some(e), _, _) => {
-            ui.label(egui::RichText::new(format!("音频: {e}")).small().weak());
+    // 静音状态说明 + 调试用的会话列表（静音功能排查全靠它）
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(s.audio.summary()).small().weak());
+        if ui.button("刷新音频信息").clicked() {
+            state.lock().audio.rescan();
         }
-        (None, Some(m), n) if n > 0 => {
+    });
+    ui.collapsing("查看系统上的所有音频会话（排查静音问题用）", |ui| {
+        if s.audio.all.is_empty() {
             ui.label(
-                egui::RichText::new(format!(
-                    "音频会话 {n} 个，当前{}",
-                    if m { "已静音" } else { "未静音" }
-                ))
-                .small()
-                .weak(),
+                egui::RichText::new("没有枚举到任何音频会话（系统当前没有任何程序在发声）")
+                    .small()
+                    .weak(),
             );
+            return;
         }
-        _ => {
-            ui.label(egui::RichText::new("音频: 未检测到会话").small().weak());
-        }
-    }
+        egui::Grid::new("audio_sessions_grid")
+            .num_columns(5)
+            .striped(true)
+            .spacing([10.0, 2.0])
+            .show(ui, |ui| {
+                for h in ["PID", "进程", "播放状态", "静音", "设备"] {
+                    ui.label(egui::RichText::new(h).strong());
+                }
+                ui.end_row();
+                for session in &s.audio.all {
+                    ui.monospace(session.pid.to_string());
+                    ui.monospace(if session.exe.is_empty() {
+                        "-".to_string()
+                    } else {
+                        session.exe.clone()
+                    });
+                    ui.monospace(match session.state {
+                        1 => "播放中",
+                        0 => "静默",
+                        _ => "其它",
+                    });
+                    ui.monospace(if session.muted { "是" } else { "否" });
+                    ui.monospace(format!("#{}", session.device_index + 1));
+                    ui.end_row();
+                }
+            });
+    });
 
     ui.separator();
 
@@ -375,6 +459,28 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
             ui.label("注入标题栏右键菜单");
             ui.checkbox(&mut s.inject_system_menu, "");
             ui.end_row();
+
+            ui.label("中文字体文件");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.font_file)
+                        .desired_width(280.0)
+                        .hint_text("留空 = 自动（微软雅黑等）"),
+                );
+                ui.label(egui::RichText::new("重启后生效").small().weak());
+            });
+            ui.end_row();
+
+            ui.label("关闭窗口时最小化到托盘");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.close_to_tray, "");
+                ui.label(
+                    egui::RichText::new("关闭 = 隐藏到托盘，程序继续在后台运行；退出请用托盘菜单")
+                        .small()
+                        .weak(),
+                );
+            });
+            ui.end_row();
         });
 
     ui.horizontal(|ui| {
@@ -411,7 +517,7 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
     });
 
     ui.label(
-        egui::RichText::new(format!("配置文件: {}", snap.config_path))
+        egui::RichText::new(format!("配置文件: {}", s.config_path))
             .small()
             .weak(),
     );
@@ -420,7 +526,8 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
     ui.heading("全局快捷键");
     ui.label(
         egui::RichText::new(
-            "格式：修饰键在前、主键在最后，例如 Ctrl+Alt+T。修饰键可用 Ctrl / Alt / Shift / Super。改完点「应用快捷键」。",
+            "格式：修饰键在前、主键在最后，例如 Ctrl+Alt+T。修饰键可用 Ctrl / Alt / Shift / Super。\
+             **留空表示不注册该快捷键。** 改完点「应用快捷键」。",
         )
         .small()
         .weak(),
@@ -475,7 +582,7 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
         .max_height(160.0)
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            for line in &snap.log_tail {
+            for line in &s.log_tail {
                 ui.monospace(line);
             }
         });

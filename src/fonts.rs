@@ -27,16 +27,30 @@ fn font_dir() -> PathBuf {
     windir.join("Fonts")
 }
 
-/// 安装中文字体，返回实际使用的字体文件名
-pub fn install(ctx: &Context) -> Option<String> {
+/// 安装中文字体，返回实际使用的字体文件名。
+///
+/// `override_file` 非空时优先用它（绝对路径，或者 `%WINDIR%\Fonts` 下的文件名）。
+pub fn install(ctx: &Context, override_file: &str) -> Option<String> {
     let dir = font_dir();
+
+    // 候选列表：用户指定的排最前，然后是内置优先级
+    let mut candidates: Vec<(PathBuf, u32, String)> = Vec::new();
+    let custom = override_file.trim();
+    if !custom.is_empty() {
+        let raw = PathBuf::from(custom);
+        let path = if raw.is_absolute() { raw } else { dir.join(&raw) };
+        candidates.push((path, 0, custom.to_string()));
+    }
     for (name, index) in CANDIDATES {
-        let path = dir.join(name);
+        candidates.push((dir.join(name), *index, (*name).to_string()));
+    }
+
+    for (path, index, label) in candidates {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         let mut data = FontData::from_owned(bytes);
-        data.index = *index;
+        data.index = index;
 
         let mut fonts = FontDefinitions::default();
         fonts.font_data.insert("cjk".to_owned(), Arc::new(data));
@@ -50,7 +64,7 @@ pub fn install(ctx: &Context) -> Option<String> {
                 .push("cjk".to_owned());
         }
         ctx.set_fonts(fonts);
-        return Some((*name).to_string());
+        return Some(label);
     }
     None
 }

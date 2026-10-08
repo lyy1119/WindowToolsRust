@@ -23,14 +23,18 @@ pub struct App {
     last_audio_poll: Option<Instant>,
     last_frame_flag: Option<bool>,
     last_topmost_flag: Option<bool>,
+    /// 用户是否已经明确要求退出（托盘菜单「退出」/ 关掉「关闭最小化到托盘」时点 X）
+    quitting: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, state: Shared) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
+        let cfg = state.lock().config.clone();
+
         // egui 自带字体不含 CJK，不装系统字体的话中文全是方框
-        match crate::fonts::install(&cc.egui_ctx) {
+        match crate::fonts::install(&cc.egui_ctx, &cfg.font_file) {
             Some(name) => state.lock().log(format!("已加载中文字体: {name}")),
             None => state
                 .lock()
@@ -44,13 +48,20 @@ impl App {
                 None
             }
         };
-        let cfg = state.lock().config.clone();
+        // 启动时自己检查一下有没有管理员权限
+        if state.lock().elevated() {
+            state.lock().log("权限检查: 已以管理员身份运行");
+        } else {
+            state.lock().log(
+                "权限检查: 未以管理员身份运行 —— 无法操作以管理员权限运行的窗口（界面顶部有提权按钮）",
+            );
+        }
 
         let hotkeys = match hotkey::build(&cfg) {
             Ok(h) => {
                 state.lock().log(format!(
-                    "全局热键已注册: 拾取 {} / 红框 {} / 置顶 {} / 静音 {}",
-                    cfg.hotkey_pick, cfg.hotkey_frame, cfg.hotkey_topmost, cfg.hotkey_mute
+                    "全局热键已注册: {}",
+                    hotkey::describe(&cfg)
                 ));
                 Some(h)
             }
@@ -60,7 +71,8 @@ impl App {
             }
         };
 
-        let ui_state = UiState::new(&cfg);
+        let config_path = state.lock().config_path.display().to_string();
+        let ui_state = UiState::new(&cfg, config_path);
 
         Self {
             state,
@@ -70,6 +82,7 @@ impl App {
             last_audio_poll: None,
             last_frame_flag: None,
             last_topmost_flag: None,
+            quitting: false,
         }
     }
 
@@ -104,6 +117,7 @@ impl App {
                     self.state.lock().log(format!("[托盘] {msg}"));
                 }
                 tray::ID_QUIT => {
+                    self.quitting = true;
                     self.state.lock().save_config();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -114,19 +128,25 @@ impl App {
 
     fn pump_hotkeys(&mut self, ctx: &egui::Context) {
         let Some(hk) = self.hotkeys.as_ref() else { return };
-        let (pick, frame_hk, topmost, mute) = (hk.pick.id, hk.frame.id, hk.topmost.id, hk.mute.id);
+        // 留空的快捷键是 None，不参与匹配
+        let ids = [
+            hk.pick.map(|k| k.id),
+            hk.frame.map(|k| k.id),
+            hk.topmost.map(|k| k.id),
+            hk.mute.map(|k| k.id),
+        ];
 
         while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
             if ev.state != HotKeyState::Pressed {
                 continue;
             }
-            let result = if ev.id == pick {
+            let result = if ids[0] == Some(ev.id) {
                 actions::pick_under_cursor(&self.state).map(|t| format!("已选中: {}", t.short_label()))
-            } else if ev.id == frame_hk {
+            } else if ids[1] == Some(ev.id) {
                 actions::toggle_frame(&self.state)
-            } else if ev.id == topmost {
+            } else if ids[2] == Some(ev.id) {
                 actions::toggle_topmost(&self.state)
-            } else if ev.id == mute {
+            } else if ids[3] == Some(ev.id) {
                 actions::toggle_mute(&self.state)
             } else {
                 continue;
@@ -166,10 +186,7 @@ impl App {
 
         match result {
             Ok(()) => {
-                let msg = format!(
-                    "全局热键已更新: 拾取 {} / 红框 {} / 置顶 {} / 静音 {}",
-                    cfg.hotkey_pick, cfg.hotkey_frame, cfg.hotkey_topmost, cfg.hotkey_mute
-                );
+                let msg = format!("全局热键已更新: {}", hotkey::describe(&cfg));
                 self.state.lock().log(msg);
             }
             Err(e) => {
@@ -187,23 +204,64 @@ impl App {
         self.ui_state.hotkey_mute = live.hotkey_mute;
     }
 
-    /// 周期性刷新目标进程的静音状态
+    /// 只做「把音频工作线程的快照搬到界面状态」这件轻活。
+    ///
+    /// 真正的设备/会话枚举在工作线程里完成且有缓存（1.5s），
+    /// 不会因为界面每帧刷新就反复枚举 COM 对象。
     fn poll_audio(&mut self) {
         let due = self
             .last_audio_poll
-            .map(|t| t.elapsed() >= Duration::from_millis(800))
+            .map(|t| t.elapsed() >= Duration::from_millis(600))
             .unwrap_or(true);
         if !due {
             return;
         }
         self.last_audio_poll = Some(Instant::now());
 
-        let mut st = self.state.lock();
-        if let Some(pid) = st.target_pid() {
-            st.audio.refresh(pid);
+        // 只有音频快照的版本号变了才整表拷贝（内部已经做了「内容没变不改版本号」）
+        let snap = self.state.lock().audio.snapshot();
+        if snap.rev != self.ui_state.audio.rev || snap.error != self.ui_state.audio.error {
+            self.ui_state.audio = snap;
         }
-        let snap = st.audio.snapshot();
-        st.audio_snapshot = snap;
+    }
+
+    /// 日志尾部缓存：只在日志版本号变化时重建，避免每帧克隆几百条字符串。
+    fn refresh_log_tail(&mut self) {
+        let rev = self.state.lock().log_rev;
+        if rev == self.ui_state.log_rev {
+            return;
+        }
+        let (rev, tail) = {
+            let st = self.state.lock();
+            (
+                st.log_rev,
+                st.log.iter().rev().take(150).rev().cloned().collect::<Vec<_>>(),
+            )
+        };
+        self.ui_state.log_rev = rev;
+        self.ui_state.log_tail = tail;
+    }
+
+    /// 点窗口关闭按钮时的处理：默认只隐藏到托盘，让托盘继续常驻。
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        let (close_to_tray, pending_quit) = {
+            let st = self.state.lock();
+            (st.config.close_to_tray, st.pending_quit)
+        };
+        if self.quitting || pending_quit || !close_to_tray {
+            // 真退出：不再拦截
+            self.quitting = true;
+            return;
+        }
+        // 取消这次关闭，改为隐藏窗口；进程与托盘继续活着
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.state
+            .lock()
+            .log("窗口已隐藏到托盘，程序继续在后台运行（托盘图标右键 → 退出 可结束）");
     }
 
     /// 托盘勾选状态跟随实际状态
@@ -231,20 +289,22 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_close_request(ctx);
         self.apply_pending_hotkeys();
         self.pump_tray_menu(ctx);
         self.pump_hotkeys(ctx);
         self.pump_tray_icon(ctx);
         self.poll_audio();
+        self.refresh_log_tail();
         self.sync_tray_state();
 
         // 红框跟随的兜底轮询：即使 WinEvent 钩子漏事件，红框也不会卡住不动。
-        // 有红框时提高刷新率让跟随更跟手，没有时降低刷新率省 CPU。
+        // 有红框时提高刷新率让跟随更跟手，没有时降到 4~5Hz 省 CPU。
         frame::tick();
         let interval = if frame::is_active() {
             Duration::from_millis(33)
         } else {
-            Duration::from_millis(200)
+            Duration::from_millis(400)
         };
         // 主窗口隐藏时也要保持轮询（托盘 / 钩子回调依赖消息循环持续运转）
         ctx.request_repaint_after(interval);

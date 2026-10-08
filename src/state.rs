@@ -1,7 +1,7 @@
 //! 全局应用状态。所有模块共享一个 `Shared`（Arc<Mutex<AppState>>）。
 
 use crate::config::Config;
-use crate::win::audio::{AudioService, AudioSnapshot};
+use crate::win::audio::AudioService;
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +16,8 @@ pub struct TargetWindow {
     pub title: String,
     pub class: String,
     pub pid: u32,
+    /// 进程可执行文件名，用于按进程名匹配音频会话
+    pub exe: String,
 }
 
 impl TargetWindow {
@@ -34,7 +36,6 @@ pub struct AppState {
     pub target: Option<TargetWindow>,
     pub frame_on: bool,
     pub audio: AudioService,
-    pub audio_snapshot: AudioSnapshot,
     /// 当前已经注入过系统菜单的窗口 hwnd
     pub menu_injected: Option<isize>,
     /// 因为「置顶时自动标记红框」而加上的红框属于哪个窗口。
@@ -42,7 +43,15 @@ pub struct AppState {
     pub frame_auto_for_topmost: Option<isize>,
     /// 界面改了快捷键后置位，由 App 在下一帧真正重新注册
     pub pending_hotkey_apply: bool,
+    /// 界面要求真正退出（例如点了「以管理员身份重启」）。
+    /// 有这个标记时就不再拦截窗口关闭，否则会被「关闭最小化到托盘」吃掉。
+    pub pending_quit: bool,
     pub log: Vec<String>,
+    /// 日志版本号：每次写日志 +1。
+    /// 界面据此判断「日志有没有变」，避免每帧都克隆一遍日志（之前的内存/CPU 浪费点）。
+    pub log_rev: u64,
+    /// 启动时检测到的管理员权限状态
+    pub elevated: bool,
 }
 
 impl AppState {
@@ -53,11 +62,14 @@ impl AppState {
             target: None,
             frame_on: false,
             audio: AudioService::spawn(),
-            audio_snapshot: AudioSnapshot::default(),
             menu_injected: None,
             frame_auto_for_topmost: None,
             pending_hotkey_apply: false,
+            pending_quit: false,
             log: Vec::new(),
+            log_rev: 0,
+            // 启动时自己检查一次是否有管理员权限
+            elevated: crate::win::privilege::is_elevated(),
         }
     }
 
@@ -65,7 +77,8 @@ impl AppState {
         let line = format!("[{}] {}", timestamp(), msg.into());
         log::info!("{line}");
         self.log.push(line);
-        if self.log.len() > 500 {
+        self.log_rev = self.log_rev.wrapping_add(1);
+        if self.log.len() > 300 {
             self.log.drain(..100);
         }
     }
@@ -76,9 +89,9 @@ impl AppState {
         }
     }
 
-    /// 目标窗口的进程 id（没有目标时返回 None）
-    pub fn target_pid(&self) -> Option<u32> {
-        self.target.as_ref().map(|t| t.pid)
+    /// 当前是否以管理员身份运行
+    pub fn elevated(&self) -> bool {
+        self.elevated
     }
 }
 

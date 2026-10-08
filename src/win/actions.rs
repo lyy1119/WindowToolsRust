@@ -90,7 +90,7 @@ pub fn set_target(
         }
     }
 
-    state.lock().audio.refresh(info.pid);
+    state.lock().audio.focus(info.pid, info.exe.clone());
     Ok(info)
 }
 
@@ -210,14 +210,17 @@ pub fn toggle_topmost(state: &Shared) -> Result<String> {
 
 pub fn toggle_mute(state: &Shared) -> Result<String> {
     let (_h, info) = require_target(state)?;
-    let snap = state.lock().audio.snapshot();
-    let current = snap.muted.unwrap_or(false);
+    let current = state.lock().audio.is_muted().unwrap_or(false);
     let next = !current;
-    state.lock().audio.set_mute(info.pid, next);
+    state.lock().audio.set_mute(next);
     let msg = format!(
-        "已请求{}进程 {} (PID {})",
+        "已请求{} {} 的声音（PID {}）",
         if next { "静音" } else { "取消静音" },
-        info.short_label(),
+        if info.exe.is_empty() {
+            info.short_label()
+        } else {
+            info.exe.clone()
+        },
         info.pid
     );
     state.lock().log(msg.clone());

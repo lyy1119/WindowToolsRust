@@ -4,7 +4,10 @@ use crate::state::TargetWindow;
 use crate::win::hwnd_i;
 use anyhow::{bail, Result};
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
@@ -31,6 +34,37 @@ pub fn pid(h: HWND) -> u32 {
     let mut p = 0u32;
     unsafe { GetWindowThreadProcessId(h, Some(&mut p)) };
     p
+}
+
+/// 进程的可执行文件名（如 `chrome.exe`）。取不到时返回 None
+/// （例如目标进程以更高权限运行，我们没权限查询它）。
+pub fn process_exe_name(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 512];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if !ok {
+            return None;
+        }
+        let full = String::from_utf16_lossy(&buf[..size as usize]);
+        Some(
+            full.rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(full.as_str())
+                .to_string(),
+        )
+    }
 }
 
 pub fn is_window(h: HWND) -> bool {
@@ -180,11 +214,13 @@ pub fn is_eligible(h: HWND) -> bool {
 }
 
 pub fn describe(h: HWND) -> TargetWindow {
+    let process_id = pid(h);
     TargetWindow {
         hwnd: hwnd_i(h),
         title: title(h),
         class: class_name(h),
-        pid: pid(h),
+        pid: process_id,
+        exe: process_exe_name(process_id).unwrap_or_default(),
     }
 }
 
