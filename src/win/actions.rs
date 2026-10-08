@@ -62,8 +62,13 @@ pub fn set_target(
 
     {
         let mut st = state.lock();
+        let changed = st.target.as_ref().map(|t| t.hwnd) != Some(info.hwnd);
         st.target = Some(info.clone());
         st.menu_injected = None;
+        if changed {
+            // 换窗口了，之前「为置顶自动加的红框」的记录作废
+            st.frame_auto_for_topmost = None;
+        }
         st.log(format!("[{source}] 已选中窗口: {}", info.short_label()));
     }
 
@@ -115,7 +120,11 @@ pub fn pick_foreground(state: &Shared) -> Result<TargetWindow> {
 pub fn toggle_frame_for(state: &Shared, h: HWND) -> Result<String> {
     if frame::active_target() == Some(hwnd_i(h)) {
         frame::hide();
-        state.lock().frame_on = false;
+        {
+            let mut st = state.lock();
+            st.frame_on = false;
+            st.frame_auto_for_topmost = None;
+        }
         let msg = format!("已关闭 {} 的红框", window::title(h));
         state.lock().log(msg.clone());
         return Ok(msg);
@@ -125,7 +134,12 @@ pub fn toggle_frame_for(state: &Shared, h: HWND) -> Result<String> {
         (st.config.frame_color, st.config.frame_thickness)
     };
     frame::show(h, rgb, th)?;
-    state.lock().frame_on = true;
+    {
+        let mut st = state.lock();
+        st.frame_on = true;
+        // 手动标记的红框不属于「置顶自动加的那一个」
+        st.frame_auto_for_topmost = None;
+    }
     let msg = format!("已标记 {} 的红框", window::title(h));
     state.lock().log(msg.clone());
     Ok(msg)
@@ -135,7 +149,11 @@ pub fn toggle_frame_for(state: &Shared, h: HWND) -> Result<String> {
 pub fn toggle_frame(state: &Shared) -> Result<String> {
     if frame::is_active() {
         frame::hide();
-        state.lock().frame_on = false;
+        {
+            let mut st = state.lock();
+            st.frame_on = false;
+            st.frame_auto_for_topmost = None;
+        }
         return Ok("已关闭红框".into());
     }
     let (h, _) = require_target(state)?;
@@ -145,10 +163,46 @@ pub fn toggle_frame(state: &Shared) -> Result<String> {
 pub fn toggle_topmost(state: &Shared) -> Result<String> {
     let (h, info) = require_target(state)?;
     let on = window::toggle_topmost(h)?;
+
+    // 「置顶时自动标记红框」：这是为了让人一眼看出窗口被钉在最上面了。
+    // 只记录我们自动加的那一个，取消置顶时只移除它，不碰用户手动标的红框。
+    let mut suffix = String::new();
+    if on {
+        let auto = state.lock().config.auto_frame_on_topmost;
+        if auto && frame::active_target() != Some(hwnd_i(h)) {
+            let (rgb, th) = {
+                let st = state.lock();
+                (st.config.frame_color, st.config.frame_thickness)
+            };
+            match frame::show(h, rgb, th) {
+                Ok(()) => {
+                    let mut st = state.lock();
+                    st.frame_on = true;
+                    st.frame_auto_for_topmost = Some(hwnd_i(h));
+                    suffix = "，并已自动标记红框".into();
+                }
+                Err(e) => state.lock().log(format!("自动标记红框失败: {e:#}")),
+            }
+        }
+    } else {
+        let auto_hwnd = state.lock().frame_auto_for_topmost;
+        if auto_hwnd == Some(hwnd_i(h)) {
+            frame::hide();
+            let mut st = state.lock();
+            st.frame_on = false;
+            st.frame_auto_for_topmost = None;
+            suffix = "，并已移除自动标记的红框".into();
+        }
+    }
+
     let msg = format!(
-        "{} 已{}",
-        info.short_label(),
-        if on { "置顶" } else { "取消置顶" }
+        "{}{}",
+        format_args!(
+            "{} 已{}",
+            info.short_label(),
+            if on { "置顶" } else { "取消置顶" }
+        ),
+        suffix
     );
     state.lock().log(msg.clone());
     Ok(msg)

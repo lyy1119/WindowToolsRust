@@ -31,6 +31,13 @@ pub struct Config {
     pub inject_system_menu: bool,
     /// 是否在选中目标窗口时自动显示红框
     pub auto_frame_on_pick: bool,
+    /// 窗口置顶时是否自动给它标记红框（取消置顶时会自动移除这个自动加上的红框）
+    pub auto_frame_on_topmost: bool,
+    /// 全局快捷键（格式如 `Ctrl+Alt+T`，键名可用 `T` 或 `KeyT`）
+    pub hotkey_pick: String,
+    pub hotkey_frame: String,
+    pub hotkey_topmost: String,
+    pub hotkey_mute: String,
     /// 常用分辨率预设
     pub presets: Vec<ResolutionPreset>,
 }
@@ -44,6 +51,11 @@ impl Default for Config {
             restore_before_resize: true,
             inject_system_menu: true,
             auto_frame_on_pick: true,
+            auto_frame_on_topmost: true,
+            hotkey_pick: "Ctrl+Alt+P".to_string(),
+            hotkey_frame: "Ctrl+Alt+F".to_string(),
+            hotkey_topmost: "Ctrl+Alt+T".to_string(),
+            hotkey_mute: "Ctrl+Alt+M".to_string(),
             presets: vec![
                 ResolutionPreset::new("1920 x 1080", 1920, 1080),
                 ResolutionPreset::new("1600 x 900", 1600, 900),

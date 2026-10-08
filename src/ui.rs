@@ -1,7 +1,6 @@
 //! egui 界面。刻意只做「显示 + 触发动作」，所有 Windows 操作都通过 `win::actions`。
 
 use crate::config::{Config, ResolutionPreset};
-use crate::hotkey::Hotkeys;
 use crate::state::{Shared, TargetWindow};
 use crate::win::{actions, frame, sysmenu, window};
 use eframe::egui;
@@ -22,12 +21,17 @@ pub struct UiState {
     pub resize_client_area: bool,
     pub restore_before_resize: bool,
     pub auto_frame_on_pick: bool,
+    /// 置顶时自动给窗口标记红框
+    pub auto_frame_on_topmost: bool,
     pub inject_system_menu: bool,
-    pub hotkey_help: Vec<(String, String)>,
+    pub hotkey_pick: String,
+    pub hotkey_frame: String,
+    pub hotkey_topmost: String,
+    pub hotkey_mute: String,
 }
 
 impl UiState {
-    pub fn new(cfg: &Config, hotkeys: Option<&Hotkeys>) -> Self {
+    pub fn new(cfg: &Config) -> Self {
         Self {
             windows: Vec::new(),
             pick_idx: 0,
@@ -42,15 +46,12 @@ impl UiState {
             resize_client_area: cfg.resize_client_area,
             restore_before_resize: cfg.restore_before_resize,
             auto_frame_on_pick: cfg.auto_frame_on_pick,
+            auto_frame_on_topmost: cfg.auto_frame_on_topmost,
             inject_system_menu: cfg.inject_system_menu,
-            hotkey_help: hotkeys
-                .map(|h| {
-                    h.describe()
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            hotkey_pick: cfg.hotkey_pick.clone(),
+            hotkey_frame: cfg.hotkey_frame.clone(),
+            hotkey_topmost: cfg.hotkey_topmost.clone(),
+            hotkey_mute: cfg.hotkey_mute.clone(),
         }
     }
 
@@ -61,7 +62,12 @@ impl UiState {
         cfg.resize_client_area = self.resize_client_area;
         cfg.restore_before_resize = self.restore_before_resize;
         cfg.auto_frame_on_pick = self.auto_frame_on_pick;
+        cfg.auto_frame_on_topmost = self.auto_frame_on_topmost;
         cfg.inject_system_menu = self.inject_system_menu;
+        cfg.hotkey_pick = self.hotkey_pick.trim().to_string();
+        cfg.hotkey_frame = self.hotkey_frame.trim().to_string();
+        cfg.hotkey_topmost = self.hotkey_topmost.trim().to_string();
+        cfg.hotkey_mute = self.hotkey_mute.trim().to_string();
         cfg.presets = self.presets.clone();
     }
 }
@@ -355,6 +361,17 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
             ui.checkbox(&mut s.auto_frame_on_pick, "");
             ui.end_row();
 
+            ui.label("置顶时自动标记红框");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.auto_frame_on_topmost, "");
+                ui.label(
+                    egui::RichText::new("取消置顶时会自动移除这个红框；手动标的红框不受影响")
+                        .small()
+                        .weak(),
+                );
+            });
+            ui.end_row();
+
             ui.label("注入标题栏右键菜单");
             ui.checkbox(&mut s.inject_system_menu, "");
             ui.end_row();
@@ -362,8 +379,13 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
 
     ui.horizontal(|ui| {
         if ui.button("💾 保存设置").clicked() {
-            s.apply_to(&mut state.lock().config);
-            state.lock().save_config();
+            {
+                let mut st = state.lock();
+                s.apply_to(&mut st.config);
+                // 快捷键可能也改了，顺手重新注册一遍
+                st.pending_hotkey_apply = true;
+                st.save_config();
+            }
             // 预设变了，顺手把右键菜单里的子菜单刷新一遍
             if let Some(t) = &snap.target {
                 let presets = state.lock().config.presets.clone();
@@ -394,21 +416,52 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
             .weak(),
     );
 
-    if !s.hotkey_help.is_empty() {
-        ui.separator();
-        ui.heading("全局快捷键");
-        egui::Grid::new("hotkey_grid")
-            .num_columns(2)
-            .spacing([12.0, 2.0])
-            .show(ui, |ui| {
-                for (name, key) in &s.hotkey_help {
-                    ui.label(name);
-                    ui.monospace(key);
-                    ui.end_row();
-                }
-            });
-    }
+    ui.separator();
+    ui.heading("全局快捷键");
+    ui.label(
+        egui::RichText::new(
+            "格式：修饰键在前、主键在最后，例如 Ctrl+Alt+T。修饰键可用 Ctrl / Alt / Shift / Super。改完点「应用快捷键」。",
+        )
+        .small()
+        .weak(),
+    );
+    egui::Grid::new("hotkey_grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("拾取光标下的窗口");
+            ui.add(egui::TextEdit::singleline(&mut s.hotkey_pick).desired_width(180.0));
+            ui.end_row();
 
+            ui.label("红框开关");
+            ui.add(egui::TextEdit::singleline(&mut s.hotkey_frame).desired_width(180.0));
+            ui.end_row();
+
+            ui.label("置顶开关");
+            ui.add(egui::TextEdit::singleline(&mut s.hotkey_topmost).desired_width(180.0));
+            ui.end_row();
+
+            ui.label("静音开关");
+            ui.add(egui::TextEdit::singleline(&mut s.hotkey_mute).desired_width(180.0));
+            ui.end_row();
+        });
+    ui.horizontal(|ui| {
+        if ui.button("⌨ 应用快捷键").clicked() {
+            {
+                let mut st = state.lock();
+                s.apply_to(&mut st.config);
+                st.pending_hotkey_apply = true;
+                st.save_config();
+            }
+            toast = Some("快捷键已提交，正在重新注册（结果见下方日志）".into());
+        }
+        if ui.button("恢复默认快捷键").clicked() {
+            s.hotkey_pick = "Ctrl+Alt+P".into();
+            s.hotkey_frame = "Ctrl+Alt+F".into();
+            s.hotkey_topmost = "Ctrl+Alt+T".into();
+            s.hotkey_mute = "Ctrl+Alt+M".into();
+        }
+    });
     if !toast.as_deref().unwrap_or("").is_empty() {
         let msg = toast.clone().unwrap_or_default();
         ui.separator();

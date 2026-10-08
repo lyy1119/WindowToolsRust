@@ -44,9 +44,14 @@ impl App {
                 None
             }
         };
-        let hotkeys = match hotkey::build() {
+        let cfg = state.lock().config.clone();
+
+        let hotkeys = match hotkey::build(&cfg) {
             Ok(h) => {
-                state.lock().log("全局热键已注册: Ctrl+Alt+P/F/T/M");
+                state.lock().log(format!(
+                    "全局热键已注册: 拾取 {} / 红框 {} / 置顶 {} / 静音 {}",
+                    cfg.hotkey_pick, cfg.hotkey_frame, cfg.hotkey_topmost, cfg.hotkey_mute
+                ));
                 Some(h)
             }
             Err(e) => {
@@ -55,10 +60,7 @@ impl App {
             }
         };
 
-        let ui_state = {
-            let cfg = state.lock().config.clone();
-            UiState::new(&cfg, hotkeys.as_ref())
-        };
+        let ui_state = UiState::new(&cfg);
 
         Self {
             state,
@@ -143,6 +145,48 @@ impl App {
         }
     }
 
+    /// 界面改了快捷键后，在这里真正重新注册
+    fn apply_pending_hotkeys(&mut self) {
+        if !self.state.lock().pending_hotkey_apply {
+            return;
+        }
+        self.state.lock().pending_hotkey_apply = false;
+        let cfg = self.state.lock().config.clone();
+
+        let result = match self.hotkeys.as_mut() {
+            Some(h) => h.reapply(&cfg),
+            None => match hotkey::build(&cfg) {
+                Ok(h) => {
+                    self.hotkeys = Some(h);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
+        };
+
+        match result {
+            Ok(()) => {
+                let msg = format!(
+                    "全局热键已更新: 拾取 {} / 红框 {} / 置顶 {} / 静音 {}",
+                    cfg.hotkey_pick, cfg.hotkey_frame, cfg.hotkey_topmost, cfg.hotkey_mute
+                );
+                self.state.lock().log(msg);
+            }
+            Err(e) => {
+                // 注册失败时 reapply 已经把旧的热键恢复回去了
+                self.state
+                    .lock()
+                    .log(format!("全局热键更新失败，已保留原有快捷键: {e:#}"));
+            }
+        }
+        // 让界面上的输入框回到「真正生效的值」
+        let live = self.state.lock().config.clone();
+        self.ui_state.hotkey_pick = live.hotkey_pick;
+        self.ui_state.hotkey_frame = live.hotkey_frame;
+        self.ui_state.hotkey_topmost = live.hotkey_topmost;
+        self.ui_state.hotkey_mute = live.hotkey_mute;
+    }
+
     /// 周期性刷新目标进程的静音状态
     fn poll_audio(&mut self) {
         let due = self
@@ -187,6 +231,7 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_pending_hotkeys();
         self.pump_tray_menu(ctx);
         self.pump_hotkeys(ctx);
         self.pump_tray_icon(ctx);
