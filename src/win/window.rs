@@ -196,21 +196,57 @@ pub fn foreground_window() -> Option<HWND> {
     }
 }
 
-/// 是否是一个“值得操作”的普通顶层窗口（过滤掉工具窗口、无标题窗口等）
+/// shell 自己的窗口（桌面、任务栏、缩略图等），不是用户想操作的对象
+const SHELL_CLASSES: [&str; 6] = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "TaskListThumbnailWnd",
+    "ForegroundStaging",
+];
+
+pub fn is_own_process(h: HWND) -> bool {
+    pid(h) == std::process::id()
+}
+
+/// 是否是一个「值得操作」的顶层窗口。
+///
+/// **注意：这里刻意不要求必须有 WS_CAPTION。**
+/// 之前要求「必须有标题栏」，导致 PotPlayer 的皮肤模式、各种自绘标题栏的程序
+/// （用 WS_POPUP / 无 WS_CAPTION 自己画一条标题栏）被直接判为「不支持操作」，
+/// 快捷键和拾取都用不了。现在的判定是：
+///   * 必须是可见的顶层窗口（root == 自己）；
+///   * 不是本程序自己的窗口，也不是 shell 的桌面/任务栏；
+///   * 不是「工具窗口/不可激活窗口」——但如果它有标题栏就仍然放行
+///     （有些正常窗口会误设这些风格）；
+///   * 尺寸不能太小（过滤掉工具条、浮动面板之类）。
 pub fn is_eligible(h: HWND) -> bool {
     if !is_window(h) || !is_visible(h) {
         return false;
     }
-    let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32;
-    const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
-    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
-    if ex & WS_EX_TOOLWINDOW != 0 || ex & WS_EX_NOACTIVATE != 0 {
+    if unsafe { GetAncestor(h, GA_ROOT) }.0 != h.0 {
+        return false; // 只接受顶层窗口
+    }
+    if is_own_process(h) {
         return false;
     }
-    // 必须有标题栏（否则连系统菜单都没有）
-    let style = unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32;
+    if SHELL_CLASSES.contains(&class_name(h).as_str()) {
+        return false;
+    }
+
     const WS_CAPTION: u32 = 0x00C0_0000;
-    style & WS_CAPTION == WS_CAPTION
+    const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    let style = unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32;
+    let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32;
+    let has_caption = style & WS_CAPTION == WS_CAPTION;
+    if !has_caption && ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) != 0 {
+        return false;
+    }
+
+    let Ok(rc) = rect(h) else { return false };
+    (rc.right - rc.left) >= 80 && (rc.bottom - rc.top) >= 60
 }
 
 pub fn describe(h: HWND) -> TargetWindow {

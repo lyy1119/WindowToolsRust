@@ -24,6 +24,40 @@ fn require_target(state: &Shared) -> Result<(HWND, TargetWindow)> {
     Ok((h, t))
 }
 
+/// 在当前前台窗口和已拾取目标之间选一个作为「这次动作的对象」。
+///
+/// * `prefer_foreground = true`（快捷键默认走这条）：
+///   直接用**当前前台窗口** —— 这就是 WindowTop 的行为，也是「我盯着哪个窗口就操作哪个」
+///   最自然的语义。自绘标题栏的程序（Firefox、PotPlayer 皮肤模式）没有系统菜单，
+///   只能靠快捷键，所以这条路径必须能用。
+/// * 前台窗口是本程序自己的窗口、或不是可操作窗口时，自动退回已拾取的目标。
+fn resolve_target(state: &Shared, prefer_foreground: bool) -> Result<(HWND, TargetWindow)> {
+    if prefer_foreground {
+        if let Some(fg) = window::foreground_window() {
+            // is_eligible 会排除本程序自己的窗口（主界面、托盘菜单的宿主窗口）
+            if window::is_eligible(fg) {
+                let info = sync_target_quiet(state, fg)?;
+                return Ok((fg, info));
+            }
+        }
+    }
+    require_target(state)
+}
+
+/// 把某个窗口静默地同步成「当前目标」。
+/// 已经是目标时直接返回缓存，不做任何系统调用。
+fn sync_target_quiet(state: &Shared, h: HWND) -> Result<TargetWindow> {
+    {
+        let st = state.lock();
+        if let Some(t) = &st.target {
+            if t.hwnd == hwnd_i(h) && window::is_window(h) {
+                return Ok(t.clone());
+            }
+        }
+    }
+    set_target(state, h, "快捷键", false)
+}
+
 /// 选中一个窗口作为目标。
 ///
 /// `want_frame` 决定是否顺手标记红框。**只有「用户主动拾取/选择」时才该为 true**，
@@ -73,13 +107,21 @@ pub fn set_target(
     }
 
     if inject {
-        match sysmenu::inject(h, &presets) {
-            Ok(()) => {
-                let mut st = state.lock();
-                st.menu_injected = Some(info.hwnd);
-                st.log("已往该窗口的标题栏右键菜单注入条目");
+        if !sysmenu::has_system_menu(h) {
+            // Firefox、PotPlayer 皮肤模式这类自绘标题栏的程序根本没有系统菜单，
+            // 注入是不可能成功的 —— 这不是错误，跳过即可，用快捷键操作。
+            state.lock().log(
+                "该窗口没有系统菜单（自绘标题栏的程序，如 Firefox / PotPlayer 皮肤模式），                 无法注入右键菜单条目；请直接用快捷键或界面按钮操作",
+            );
+        } else {
+            match sysmenu::inject(h, &presets) {
+                Ok(()) => {
+                    let mut st = state.lock();
+                    st.menu_injected = Some(info.hwnd);
+                    st.log("已往该窗口的标题栏右键菜单注入条目");
+                }
+                Err(e) => state.lock().log(format!("注入系统菜单失败: {e:#}")),
             }
-            Err(e) => state.lock().log(format!("注入系统菜单失败: {e:#}")),
         }
     }
 
@@ -145,8 +187,15 @@ pub fn toggle_frame_for(state: &Shared, h: HWND) -> Result<String> {
     Ok(msg)
 }
 
-/// 对当前目标窗口切换红框（GUI / 托盘 / 热键用）
-pub fn toggle_frame(state: &Shared) -> Result<String> {
+/// 切换红框。
+///
+/// `prefer_foreground = true` 时作用于当前前台窗口，并且是「对这个窗口」切换，
+/// 不会因为别的窗口上已经有红框就把红框收掉。
+pub fn toggle_frame(state: &Shared, prefer_foreground: bool) -> Result<String> {
+    if prefer_foreground {
+        let (h, _) = resolve_target(state, true)?;
+        return toggle_frame_for(state, h);
+    }
     if frame::is_active() {
         frame::hide();
         {
@@ -160,8 +209,8 @@ pub fn toggle_frame(state: &Shared) -> Result<String> {
     toggle_frame_for(state, h)
 }
 
-pub fn toggle_topmost(state: &Shared) -> Result<String> {
-    let (h, info) = require_target(state)?;
+pub fn toggle_topmost(state: &Shared, prefer_foreground: bool) -> Result<String> {
+    let (h, info) = resolve_target(state, prefer_foreground)?;
     let on = window::toggle_topmost(h)?;
 
     // 「置顶时自动标记红框」：这是为了让人一眼看出窗口被钉在最上面了。
@@ -208,8 +257,8 @@ pub fn toggle_topmost(state: &Shared) -> Result<String> {
     Ok(msg)
 }
 
-pub fn toggle_mute(state: &Shared) -> Result<String> {
-    let (_h, info) = require_target(state)?;
+pub fn toggle_mute(state: &Shared, prefer_foreground: bool) -> Result<String> {
+    let (_h, info) = resolve_target(state, prefer_foreground)?;
     let current = state.lock().audio.is_muted().unwrap_or(false);
     let next = !current;
     state.lock().audio.set_mute(next);
@@ -275,8 +324,8 @@ pub fn dispatch_menu_command(cmd: u32, h: HWND, state: &Shared) {
 
     let result: Result<String> = match cmd {
         sysmenu::CMD_FRAME => toggle_frame_for(state, h),
-        sysmenu::CMD_TOPMOST => toggle_topmost(state),
-        sysmenu::CMD_MUTE => toggle_mute(state),
+        sysmenu::CMD_TOPMOST => toggle_topmost(state, false),
+        sysmenu::CMD_MUTE => toggle_mute(state, false),
         sysmenu::CMD_RESIZE_EMPTY => Err(anyhow::anyhow!("还没有配置分辨率预设，请先在界面里添加")),
         other => match sysmenu::preset_index(other) {
             Some(i) => resize_to_preset(state, i),

@@ -35,6 +35,11 @@ pub struct Config {
     pub auto_frame_on_topmost: bool,
     /// 点关闭按钮时是否只把窗口隐藏到托盘，而不是退出程序
     pub close_to_tray: bool,
+    /// 快捷键的作用对象：
+    /// `true`（默认）= 快捷键作用于**当前前台窗口**（和 WindowTop 行为一致），
+    /// `false` = 作用于界面里已拾取的那个目标窗口。
+    /// 托盘菜单和界面按钮始终作用于已拾取的目标。
+    pub hotkey_foreground: bool,
     /// 指定中文字体文件（绝对路径，或 %WINDIR%\Fonts 下的文件名）。
     /// **留空 = 自动按优先级挑选**（微软雅黑 → 等线 → 黑体 → 宋体 …）。
     /// 中文字体是内存占用的大头，换成更小的字体会明显降低内存。
@@ -60,6 +65,7 @@ impl Default for Config {
             auto_frame_on_pick: true,
             auto_frame_on_topmost: true,
             close_to_tray: true,
+            hotkey_foreground: true,
             font_file: String::new(),
             hotkey_pick: "Ctrl+Alt+P".to_string(),
             hotkey_frame: "Ctrl+Alt+F".to_string(),

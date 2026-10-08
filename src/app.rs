@@ -105,15 +105,15 @@ impl App {
                     self.state.lock().log(format!("[托盘] {msg}"));
                 }
                 tray::ID_FRAME => {
-                    let msg = report(actions::toggle_frame(&self.state));
+                    let msg = report(actions::toggle_frame(&self.state, false));
                     self.state.lock().log(format!("[托盘] {msg}"));
                 }
                 tray::ID_TOPMOST => {
-                    let msg = report(actions::toggle_topmost(&self.state));
+                    let msg = report(actions::toggle_topmost(&self.state, false));
                     self.state.lock().log(format!("[托盘] {msg}"));
                 }
                 tray::ID_MUTE => {
-                    let msg = report(actions::toggle_mute(&self.state));
+                    let msg = report(actions::toggle_mute(&self.state, false));
                     self.state.lock().log(format!("[托盘] {msg}"));
                 }
                 tray::ID_QUIT => {
@@ -136,18 +136,22 @@ impl App {
             hk.mute.map(|k| k.id),
         ];
 
+        // 快捷键默认作用于「当前前台窗口」（可在设置里改回作用于已拾取的目标）
+        let fg = self.state.lock().config.hotkey_foreground;
+
         while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
             if ev.state != HotKeyState::Pressed {
                 continue;
             }
             let result = if ids[0] == Some(ev.id) {
+                // 拾取按钮本身就是「取光标下的窗口」，不受前台/目标设置影响
                 actions::pick_under_cursor(&self.state).map(|t| format!("已选中: {}", t.short_label()))
             } else if ids[1] == Some(ev.id) {
-                actions::toggle_frame(&self.state)
+                actions::toggle_frame(&self.state, fg)
             } else if ids[2] == Some(ev.id) {
-                actions::toggle_topmost(&self.state)
+                actions::toggle_topmost(&self.state, fg)
             } else if ids[3] == Some(ev.id) {
-                actions::toggle_mute(&self.state)
+                actions::toggle_mute(&self.state, fg)
             } else {
                 continue;
             };

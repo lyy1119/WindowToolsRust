@@ -73,6 +73,14 @@ fn is_fixed_cmd(id: u32) -> bool {
     FIXED_CMDS.contains(&id)
 }
 
+/// 这个窗口有没有系统菜单。
+///
+/// Firefox、PotPlayer 皮肤模式这类**自绘标题栏**的程序没有系统菜单，
+/// `GetSystemMenu` 会返回 NULL —— 这种窗口只能靠快捷键/界面按钮操作。
+pub fn has_system_menu(h: HWND) -> bool {
+    unsafe { !GetSystemMenu(h, false).0.is_null() }
+}
+
 /// 往窗口的系统菜单里追加我们的条目（幂等：先清掉旧条目再追加）
 pub fn inject(h: HWND, presets: &[ResolutionPreset]) -> Result<()> {
     unsafe {
@@ -246,15 +254,18 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     if window::is_eligible(h) {
                         ARMED.store(hwnd_i(h), Relaxed);
                         ARMED_AT.store(now as i32, Relaxed);
-                        // 菜单即将弹出，趁机把条目注入进去
-                        if let Some(state) = STATE.get() {
-                            let (enabled, presets) = {
-                                let st = state.lock();
-                                (st.config.inject_system_menu, st.config.presets.clone())
-                            };
-                            if enabled {
-                                if let Err(e) = inject(h, &presets) {
-                                    log::debug!("注入系统菜单失败: {e:#}");
+                        // 菜单即将弹出，趁机把条目注入进去。
+                        // 没有系统菜单的窗口直接跳过（注入必然失败）。
+                        if has_system_menu(h) {
+                            if let Some(state) = STATE.get() {
+                                let (enabled, presets) = {
+                                    let st = state.lock();
+                                    (st.config.inject_system_menu, st.config.presets.clone())
+                                };
+                                if enabled {
+                                    if let Err(e) = inject(h, &presets) {
+                                        log::debug!("注入系统菜单失败: {e:#}");
+                                    }
                                 }
                             }
                         }

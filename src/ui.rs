@@ -25,6 +25,8 @@ pub struct UiState {
     pub auto_frame_on_topmost: bool,
     /// 关闭窗口时隐藏到托盘而不是退出
     pub close_to_tray: bool,
+    /// 快捷键作用于当前前台窗口（默认）还是已拾取的目标
+    pub hotkey_foreground: bool,
     pub font_file: String,
     pub inject_system_menu: bool,
     pub hotkey_pick: String,
@@ -58,6 +60,7 @@ impl UiState {
             auto_frame_on_pick: cfg.auto_frame_on_pick,
             auto_frame_on_topmost: cfg.auto_frame_on_topmost,
             close_to_tray: cfg.close_to_tray,
+            hotkey_foreground: cfg.hotkey_foreground,
             font_file: cfg.font_file.clone(),
             inject_system_menu: cfg.inject_system_menu,
             hotkey_pick: cfg.hotkey_pick.clone(),
@@ -80,6 +83,7 @@ impl UiState {
         cfg.auto_frame_on_pick = self.auto_frame_on_pick;
         cfg.auto_frame_on_topmost = self.auto_frame_on_topmost;
         cfg.close_to_tray = self.close_to_tray;
+        cfg.hotkey_foreground = self.hotkey_foreground;
         cfg.font_file = self.font_file.trim().to_string();
         cfg.inject_system_menu = self.inject_system_menu;
         cfg.hotkey_pick = self.hotkey_pick.trim().to_string();
@@ -260,12 +264,12 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
     ui.horizontal(|ui| {
         let frame_label = if snap.frame_on { "🔴 关闭红框" } else { "🔴 标记红框" };
         if ui.button(frame_label).clicked() {
-            toast = Some(report(actions::toggle_frame(state)));
+            toast = Some(report(actions::toggle_frame(state, false)));
         }
 
         let top_label = if snap.topmost { "取消置顶" } else { "置顶" };
         if ui.button(top_label).clicked() {
-            toast = Some(report(actions::toggle_topmost(state)));
+            toast = Some(report(actions::toggle_topmost(state, false)));
         }
 
         let mute_label = match s.audio.muted {
@@ -273,7 +277,7 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
             _ => "🔇 静音",
         };
         if ui.button(mute_label).clicked() {
-            toast = Some(report(actions::toggle_mute(state)));
+            toast = Some(report(actions::toggle_mute(state, false)));
         }
     });
 
@@ -458,6 +462,19 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
 
             ui.label("注入标题栏右键菜单");
             ui.checkbox(&mut s.inject_system_menu, "");
+            ui.end_row();
+
+            ui.label("快捷键作用于当前前台窗口");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.hotkey_foreground, "");
+                ui.label(
+                    egui::RichText::new(
+                        "勾选（推荐）：按快捷键直接操作当前活动窗口；取消：只操作上面拾取的目标",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
             ui.end_row();
 
             ui.label("中文字体文件");
