@@ -28,6 +28,12 @@ fn main() -> anyhow::Result<()> {
 
     let config_path = config::default_config_path();
     let cfg = config::Config::load(&config_path);
+
+    // 防止重复启动：已经有一个实例在跑时，通知它把窗口显示出来，然后本进程直接退出
+    if cfg.single_instance && !win::single_instance::acquire() {
+        win::single_instance::request_show();
+        return Ok(());
+    }
     let state = Arc::new(Mutex::new(state::AppState::new(cfg, config_path.clone())));
     state
         .lock()

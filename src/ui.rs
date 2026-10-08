@@ -25,6 +25,8 @@ pub struct UiState {
     pub auto_frame_on_topmost: bool,
     /// 关闭窗口时隐藏到托盘而不是退出
     pub close_to_tray: bool,
+    /// 防止重复启动
+    pub single_instance: bool,
     /// 快捷键作用于当前前台窗口（默认）还是已拾取的目标
     pub hotkey_foreground: bool,
     pub font_file: String,
@@ -60,6 +62,7 @@ impl UiState {
             auto_frame_on_pick: cfg.auto_frame_on_pick,
             auto_frame_on_topmost: cfg.auto_frame_on_topmost,
             close_to_tray: cfg.close_to_tray,
+            single_instance: cfg.single_instance,
             hotkey_foreground: cfg.hotkey_foreground,
             font_file: cfg.font_file.clone(),
             inject_system_menu: cfg.inject_system_menu,
@@ -83,6 +86,7 @@ impl UiState {
         cfg.auto_frame_on_pick = self.auto_frame_on_pick;
         cfg.auto_frame_on_topmost = self.auto_frame_on_topmost;
         cfg.close_to_tray = self.close_to_tray;
+        cfg.single_instance = self.single_instance;
         cfg.hotkey_foreground = self.hotkey_foreground;
         cfg.font_file = self.font_file.trim().to_string();
         cfg.inject_system_menu = self.inject_system_menu;
@@ -158,7 +162,7 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
                 .weak(),
             );
             if ui.button("以管理员身份重启").clicked() {
-                match crate::win::privilege::restart_as_admin() {
+                match actions::restart_elevated(state) {
                     Ok(()) => {
                         {
                             let mut st = state.lock();
@@ -462,6 +466,17 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
 
             ui.label("注入标题栏右键菜单");
             ui.checkbox(&mut s.inject_system_menu, "");
+            ui.end_row();
+
+            ui.label("防止重复启动（单实例）");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.single_instance, "");
+                ui.label(
+                    egui::RichText::new("已有实例在跑时，再启动只会把它的窗口唤出来，然后自己退出")
+                        .small()
+                        .weak(),
+                );
+            });
             ui.end_row();
 
             ui.label("快捷键作用于当前前台窗口");

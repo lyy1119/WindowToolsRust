@@ -92,6 +92,17 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// 有别的实例启动过 → 它请求我们把窗口显示出来
+    fn pump_show_request(&mut self, ctx: &egui::Context) {
+        if !self.state.lock().config.single_instance {
+            return;
+        }
+        if crate::win::single_instance::take_show_request() {
+            Self::show_main_window(ctx);
+            self.state.lock().log("检测到重复启动，已唤出主窗口");
+        }
+    }
+
     fn pump_tray_menu(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             let id = ev.id.as_ref().to_string();
@@ -294,6 +305,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
+        self.pump_show_request(ctx);
         self.apply_pending_hotkeys();
         self.pump_tray_menu(ctx);
         self.pump_hotkeys(ctx);

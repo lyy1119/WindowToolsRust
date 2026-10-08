@@ -35,6 +35,8 @@ pub struct Config {
     pub auto_frame_on_topmost: bool,
     /// 点关闭按钮时是否只把窗口隐藏到托盘，而不是退出程序
     pub close_to_tray: bool,
+    /// 防止重复启动：已经有实例在跑时，再启动只会把已有实例的窗口唤出来然后自己退出
+    pub single_instance: bool,
     /// 快捷键的作用对象：
     /// `true`（默认）= 快捷键作用于**当前前台窗口**（和 WindowTop 行为一致），
     /// `false` = 作用于界面里已拾取的那个目标窗口。
@@ -65,6 +67,7 @@ impl Default for Config {
             auto_frame_on_pick: true,
             auto_frame_on_topmost: true,
             close_to_tray: true,
+            single_instance: true,
             hotkey_foreground: true,
             font_file: String::new(),
             hotkey_pick: "Ctrl+Alt+P".to_string(),

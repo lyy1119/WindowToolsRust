@@ -8,6 +8,7 @@ pub mod audio;
 pub mod dpi;
 pub mod frame;
 pub mod privilege;
+pub mod single_instance;
 pub mod sysmenu;
 pub mod window;
 

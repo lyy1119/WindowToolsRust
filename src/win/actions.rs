@@ -312,6 +312,29 @@ pub fn resize_to_preset(state: &Shared, index: usize) -> Result<String> {
     resize_to(state, p.width, p.height)
 }
 
+/// 以管理员身份重启自己。
+///
+/// ⚠️ 顺序很重要：**必须先放掉单实例互斥体再 ShellExecuteW("runas")**。
+/// `ShellExecuteW` 是「新进程已经创建好了才返回」的，如果那时我们还占着互斥体，
+/// 新起来的提权进程会把自己当成第二个实例而立刻退出 —— 表现就是
+/// 「点了以管理员身份重启，结果程序反而彻底没了」。
+pub fn restart_elevated(state: &Shared) -> Result<()> {
+    let single_instance_on = state.lock().config.single_instance;
+    if single_instance_on {
+        crate::win::single_instance::release();
+    }
+    match crate::win::privilege::restart_as_admin() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 提权没成功（例如用户在 UAC 弹窗上点了「否」），把互斥体拿回来继续跑
+            if single_instance_on {
+                let _ = crate::win::single_instance::acquire();
+            }
+            Err(e)
+        }
+    }
+}
+
 /// 系统菜单注入项被点击时的入口。`h` 是被点击的那个窗口（未必是当前 target）。
 ///
 /// 注意这里 **不会** 顺手标记红框 —— 点「静音」不应该冒出红框来。
