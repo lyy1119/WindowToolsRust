@@ -1,6 +1,6 @@
 [package]
 name = "window-tools-rust"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "WindowToolsRust - a windowTop-like utility for Windows, written in Rust"
 license = "MIT"
