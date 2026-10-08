@@ -4,7 +4,7 @@
 //! 保证行为一致、日志一致。
 
 use crate::state::{Shared, TargetWindow};
-use crate::win::{frame, hwnd, sysmenu, window};
+use crate::win::{frame, hwnd, hwnd_i, sysmenu, window};
 use anyhow::{bail, Result};
 use windows::Win32::Foundation::HWND;
 
@@ -24,8 +24,16 @@ fn require_target(state: &Shared) -> Result<(HWND, TargetWindow)> {
     Ok((h, t))
 }
 
-/// 选中一个窗口作为目标：记录信息、按需注入系统菜单、按需显示红框
-pub fn set_target(state: &Shared, h: HWND, source: &str) -> Result<TargetWindow> {
+/// 选中一个窗口作为目标。
+///
+/// `want_frame` 决定是否顺手标记红框。**只有「用户主动拾取/选择」时才该为 true**，
+/// 从系统菜单触发的命令不应该顺手画红框（比如点「静音」不该冒出红框）。
+pub fn set_target(
+    state: &Shared,
+    h: HWND,
+    source: &str,
+    want_frame: bool,
+) -> Result<TargetWindow> {
     if !window::is_window(h) {
         bail!("无效的窗口句柄");
     }
@@ -34,11 +42,11 @@ pub fn set_target(state: &Shared, h: HWND, source: &str) -> Result<TargetWindow>
         bail!("该窗口没有标题，无法作为目标");
     }
 
-    let (inject, auto_frame, rgb, thickness) = {
+    let (inject, presets, rgb, thickness) = {
         let st = state.lock();
         (
             st.config.inject_system_menu,
-            st.config.auto_frame_on_pick,
+            st.config.presets.clone(),
             st.config.frame_color,
             st.config.frame_thickness,
         )
@@ -60,20 +68,20 @@ pub fn set_target(state: &Shared, h: HWND, source: &str) -> Result<TargetWindow>
     }
 
     if inject {
-        match sysmenu::inject(h) {
+        match sysmenu::inject(h, &presets) {
             Ok(()) => {
-                state.lock().menu_injected = Some(info.hwnd);
-                state.lock().log("已往该窗口的标题栏右键菜单注入条目");
+                let mut st = state.lock();
+                st.menu_injected = Some(info.hwnd);
+                st.log("已往该窗口的标题栏右键菜单注入条目");
             }
             Err(e) => state.lock().log(format!("注入系统菜单失败: {e:#}")),
         }
     }
 
-    if auto_frame {
-        if let Err(e) = frame::show(h, rgb, thickness) {
-            state.lock().log(format!("显示红框失败: {e:#}"));
-        } else {
-            state.lock().frame_on = true;
+    if want_frame {
+        match frame::show(h, rgb, thickness) {
+            Ok(()) => state.lock().frame_on = true,
+            Err(e) => state.lock().log(format!("显示红框失败: {e:#}")),
         }
     }
 
@@ -90,7 +98,8 @@ pub fn pick_under_cursor(state: &Shared) -> Result<TargetWindow> {
     if !window::is_eligible(h) {
         bail!("光标下方的窗口不支持操作（无标题栏或为工具窗口）");
     }
-    set_target(state, h, "拾取")
+    let frame = state.lock().config.auto_frame_on_pick;
+    set_target(state, h, "拾取", frame)
 }
 
 pub fn pick_foreground(state: &Shared) -> Result<TargetWindow> {
@@ -98,10 +107,31 @@ pub fn pick_foreground(state: &Shared) -> Result<TargetWindow> {
         Some(h) => h,
         None => bail!("没有前台窗口"),
     };
-    set_target(state, h, "前台窗口")
+    let frame = state.lock().config.auto_frame_on_pick;
+    set_target(state, h, "前台窗口", frame)
 }
 
-/// 红框开 / 关
+/// 以某个窗口为目标切换红框（系统菜单「标记红框」用）
+pub fn toggle_frame_for(state: &Shared, h: HWND) -> Result<String> {
+    if frame::active_target() == Some(hwnd_i(h)) {
+        frame::hide();
+        state.lock().frame_on = false;
+        let msg = format!("已关闭 {} 的红框", window::title(h));
+        state.lock().log(msg.clone());
+        return Ok(msg);
+    }
+    let (rgb, th) = {
+        let st = state.lock();
+        (st.config.frame_color, st.config.frame_thickness)
+    };
+    frame::show(h, rgb, th)?;
+    state.lock().frame_on = true;
+    let msg = format!("已标记 {} 的红框", window::title(h));
+    state.lock().log(msg.clone());
+    Ok(msg)
+}
+
+/// 对当前目标窗口切换红框（GUI / 托盘 / 热键用）
 pub fn toggle_frame(state: &Shared) -> Result<String> {
     if frame::is_active() {
         frame::hide();
@@ -109,13 +139,7 @@ pub fn toggle_frame(state: &Shared) -> Result<String> {
         return Ok("已关闭红框".into());
     }
     let (h, _) = require_target(state)?;
-    let (rgb, th) = {
-        let st = state.lock();
-        (st.config.frame_color, st.config.frame_thickness)
-    };
-    frame::show(h, rgb, th)?;
-    state.lock().frame_on = true;
-    Ok("已显示红框".into())
+    toggle_frame_for(state, h)
 }
 
 pub fn toggle_topmost(state: &Shared) -> Result<String> {
@@ -170,27 +194,39 @@ pub fn resize_to(state: &Shared, w: u32, h: u32) -> Result<String> {
     Ok(msg)
 }
 
+/// 按预设下标调整分辨率
+pub fn resize_to_preset(state: &Shared, index: usize) -> Result<String> {
+    let preset = {
+        let st = state.lock();
+        st.config.presets.get(index).cloned()
+    };
+    let Some(p) = preset else {
+        bail!("预设 #{index} 不存在");
+    };
+    resize_to(state, p.width, p.height)
+}
+
 /// 系统菜单注入项被点击时的入口。`h` 是被点击的那个窗口（未必是当前 target）。
+///
+/// 注意这里 **不会** 顺手标记红框 —— 点「静音」不应该冒出红框来。
 pub fn dispatch_menu_command(cmd: u32, h: HWND, state: &Shared) {
-    // 点击哪个窗口就作用于哪个窗口
-    if let Err(e) = set_target(state, h, &format!("系统菜单: {}", sysmenu::command_label(cmd))) {
+    let label = sysmenu::command_label(cmd);
+    if let Err(e) = set_target(state, h, &format!("系统菜单: {label}"), false) {
         state.lock().log(format!("系统菜单命令失败: {e:#}"));
         return;
     }
+
     let result: Result<String> = match cmd {
-        sysmenu::CMD_FRAME => toggle_frame(state),
+        sysmenu::CMD_FRAME => toggle_frame_for(state, h),
         sysmenu::CMD_TOPMOST => toggle_topmost(state),
         sysmenu::CMD_MUTE => toggle_mute(state),
-        sysmenu::CMD_RESIZE => {
-            // 系统菜单里没有输入框，用配置里第一个预设
-            let preset = state.lock().config.presets.first().cloned();
-            match preset {
-                Some(p) => resize_to(state, p.width, p.height),
-                None => Err(anyhow::anyhow!("没有配置分辨率预设")),
-            }
-        }
-        _ => return,
+        sysmenu::CMD_RESIZE_EMPTY => Err(anyhow::anyhow!("还没有配置分辨率预设，请先在界面里添加")),
+        other => match sysmenu::preset_index(other) {
+            Some(i) => resize_to_preset(state, i),
+            None => Err(anyhow::anyhow!("未知的菜单命令 0x{other:X}")),
+        },
     };
+
     match result {
         Ok(msg) => state.lock().log(format!("[系统菜单] {msg}")),
         Err(e) => state.lock().log(format!("[系统菜单] 执行失败: {e:#}")),

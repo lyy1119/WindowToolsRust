@@ -8,7 +8,7 @@ use crate::hotkey::{self, Hotkeys};
 use crate::state::Shared;
 use crate::tray::{self, Tray};
 use crate::ui::{self, UiState};
-use crate::win::{actions, hwnd, sysmenu, window};
+use crate::win::{actions, frame, hwnd, sysmenu, window};
 use eframe::egui;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::time::{Duration, Instant};
@@ -28,6 +28,14 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, state: Shared) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+
+        // egui 自带字体不含 CJK，不装系统字体的话中文全是方框
+        match crate::fonts::install(&cc.egui_ctx) {
+            Some(name) => state.lock().log(format!("已加载中文字体: {name}")),
+            None => state
+                .lock()
+                .log("[警告] 未找到可用的中文字体，界面中文可能显示为方框"),
+        }
 
         let tray = match tray::build() {
             Ok(t) => Some(t),
@@ -184,8 +192,17 @@ impl eframe::App for App {
         self.pump_tray_icon(ctx);
         self.poll_audio();
         self.sync_tray_state();
+
+        // 红框跟随的兜底轮询：即使 WinEvent 钩子漏事件，红框也不会卡住不动。
+        // 有红框时提高刷新率让跟随更跟手，没有时降低刷新率省 CPU。
+        frame::tick();
+        let interval = if frame::is_active() {
+            Duration::from_millis(33)
+        } else {
+            Duration::from_millis(200)
+        };
         // 主窗口隐藏时也要保持轮询（托盘 / 钩子回调依赖消息循环持续运转）
-        ctx.request_repaint_after(Duration::from_millis(200));
+        ctx.request_repaint_after(interval);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

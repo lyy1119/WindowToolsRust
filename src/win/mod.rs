@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod audio;
+pub mod dpi;
 pub mod frame;
 pub mod sysmenu;
 pub mod window;

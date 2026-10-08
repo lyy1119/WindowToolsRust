@@ -76,9 +76,17 @@ impl Config {
     }
 }
 
+/// 配置目录：`%USERPROFILE%\WindowToolsSetting\config.json`
+///
+/// 按需求放在用户主目录下（而不是 APPDATA），方便查看和备份。
 pub fn default_config_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
+    let base = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("WindowToolsRust").join("config.json")
+        .unwrap_or_else(|| {
+            // 兜底：USERPROFILE 缺失时退回 APPDATA
+            std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+        });
+    base.join("WindowToolsSetting").join("config.json")
 }

@@ -8,6 +8,7 @@
 
 mod app;
 mod config;
+mod fonts;
 mod hotkey;
 mod state;
 mod tray;
@@ -18,12 +19,19 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 fn main() -> anyhow::Result<()> {
+    // 必须最先执行：让本进程成为 Per-Monitor-V2 DPI 感知进程。
+    // 否则在高 DPI / 多显示器下，窗口坐标会被系统「虚拟化」缩放，
+    // 红框覆盖层的位置和大小都会算错。
+    win::dpi::enable_per_monitor_v2();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config_path = config::default_config_path();
     let cfg = config::Config::load(&config_path);
-    let state = Arc::new(Mutex::new(state::AppState::new(cfg, config_path)));
-    state.lock().log("WindowToolsRust 启动");
+    let state = Arc::new(Mutex::new(state::AppState::new(cfg, config_path.clone())));
+    state
+        .lock()
+        .log(format!("WindowToolsRust 启动，配置: {}", config_path.display()));
 
     // 系统菜单命令监听：低层鼠标钩子，必须在有消息循环的线程（主线程）上安装。
     // 这里先装钩子，稍后 eframe/winit 的事件循环会在同一线程上泵消息。

@@ -1,16 +1,20 @@
 //! egui 界面。刻意只做「显示 + 触发动作」，所有 Windows 操作都通过 `win::actions`。
 
-use crate::config::Config;
+use crate::config::{Config, ResolutionPreset};
 use crate::hotkey::Hotkeys;
 use crate::state::{Shared, TargetWindow};
-use crate::win::{actions, frame, window};
+use crate::win::{actions, frame, sysmenu, window};
 use eframe::egui;
 
 pub struct UiState {
     /// 窗口枚举结果（点「刷新」才重新枚举）
     pub windows: Vec<TargetWindow>,
     pub pick_idx: usize,
-    pub preset_idx: usize,
+    /// 可编辑的分辨率预设（点「保存设置」才写回配置，并刷新右键菜单子菜单）
+    pub presets: Vec<ResolutionPreset>,
+    pub new_preset_name: String,
+    pub new_preset_w: u32,
+    pub new_preset_h: u32,
     pub custom_w: u32,
     pub custom_h: u32,
     pub color: [u8; 3],
@@ -27,7 +31,10 @@ impl UiState {
         Self {
             windows: Vec::new(),
             pick_idx: 0,
-            preset_idx: 0,
+            presets: cfg.presets.clone(),
+            new_preset_name: String::new(),
+            new_preset_w: 1280,
+            new_preset_h: 720,
             custom_w: 1280,
             custom_h: 720,
             color: cfg.frame_color,
@@ -55,6 +62,7 @@ impl UiState {
         cfg.restore_before_resize = self.restore_before_resize;
         cfg.auto_frame_on_pick = self.auto_frame_on_pick;
         cfg.inject_system_menu = self.inject_system_menu;
+        cfg.presets = self.presets.clone();
     }
 }
 
@@ -63,10 +71,10 @@ struct Snapshot {
     target: Option<TargetWindow>,
     frame_on: bool,
     audio: crate::win::audio::AudioSnapshot,
-    config: Config,
     log_tail: Vec<String>,
     topmost: bool,
     resizable: bool,
+    config_path: String,
 }
 
 fn snapshot(state: &Shared) -> Snapshot {
@@ -85,10 +93,10 @@ fn snapshot(state: &Shared) -> Snapshot {
         target,
         frame_on: st.frame_on,
         audio: st.audio_snapshot.clone(),
-        config: st.config.clone(),
         log_tail,
         topmost,
         resizable,
+        config_path: st.config_path.display().to_string(),
     }
 }
 
@@ -172,12 +180,10 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
         if let Some(i) = chosen {
             s.pick_idx = i;
             let h = s.windows[i].hwnd;
-            toast = Some(report(actions::set_target(
-                state,
-                crate::win::hwnd(h),
-                "列表选择",
-            )
-            .map(|t| format!("已选中: {}", t.short_label()))));
+            let want_frame = state.lock().config.auto_frame_on_pick;
+            let r = actions::set_target(state, crate::win::hwnd(h), "列表选择", want_frame)
+                .map(|t| format!("已选中: {}", t.short_label()));
+            toast = Some(report(r));
         }
     }
 
@@ -212,9 +218,12 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
         }
         (None, Some(m), n) if n > 0 => {
             ui.label(
-                egui::RichText::new(format!("音频会话 {n} 个，当前{}", if m { "已静音" } else { "未静音" }))
-                    .small()
-                    .weak(),
+                egui::RichText::new(format!(
+                    "音频会话 {n} 个，当前{}",
+                    if m { "已静音" } else { "未静音" }
+                ))
+                .small()
+                .weak(),
             );
         }
         _ => {
@@ -222,33 +231,83 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
         }
     }
 
-    // ---------- 分辨率 ----------
     ui.separator();
-    ui.heading("调整为指定分辨率");
 
-    let presets = snap.config.presets.clone();
-    ui.horizontal(|ui| {
-        if !presets.is_empty() {
-            s.preset_idx = s.preset_idx.min(presets.len() - 1);
-            egui::ComboBox::from_label("预设")
-                .selected_text(presets[s.preset_idx].name.clone())
-                .show_ui(ui, |ui| {
-                    for (i, p) in presets.iter().enumerate() {
-                        if ui.selectable_label(s.preset_idx == i, p.name.clone()).clicked() {
-                            s.custom_w = p.width;
-                            s.custom_h = p.height;
-                        }
-                    }
-                });
-            if ui.button("应用预设").clicked() {
-                let p = presets[s.preset_idx].clone();
-                toast = Some(report(actions::resize_to(state, p.width, p.height)));
+    // ---------- 分辨率预设（可编辑） ----------
+    ui.heading("分辨率预设");
+    ui.label(
+        egui::RichText::new(
+            "这些预设会出现在标题栏右键菜单的「WindowTools: 调整到指定分辨率」子菜单里。改完记得点「保存设置」。",
+        )
+        .small()
+        .weak(),
+    );
+
+    let mut to_delete: Option<usize> = None;
+    let mut apply_idx: Option<usize> = None;
+    egui::Grid::new("preset_grid")
+        .num_columns(5)
+        .spacing([8.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("名称").strong());
+            ui.label(egui::RichText::new("宽").strong());
+            ui.label(egui::RichText::new("高").strong());
+            ui.label("");
+            ui.label("");
+            ui.end_row();
+
+            for i in 0..s.presets.len() {
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.presets[i].name)
+                        .desired_width(130.0)
+                        .hint_text("可选"),
+                );
+                ui.add(egui::DragValue::new(&mut s.presets[i].width).range(80..=16384).speed(4));
+                ui.add(egui::DragValue::new(&mut s.presets[i].height).range(60..=16384).speed(4));
+                if ui.button("应用到当前窗口").clicked() {
+                    apply_idx = Some(i);
+                }
+                if ui.button("🗑 删除").clicked() {
+                    to_delete = Some(i);
+                }
+                ui.end_row();
             }
+        });
+
+    ui.horizontal(|ui| {
+        ui.label("新增预设");
+        ui.add(
+            egui::TextEdit::singleline(&mut s.new_preset_name)
+                .desired_width(130.0)
+                .hint_text("名称（可空）"),
+        );
+        ui.add(egui::DragValue::new(&mut s.new_preset_w).range(80..=16384).speed(4));
+        ui.label("x");
+        ui.add(egui::DragValue::new(&mut s.new_preset_h).range(60..=16384).speed(4));
+        if ui.button("➕ 添加").clicked() {
+            s.presets.push(ResolutionPreset {
+                name: s.new_preset_name.trim().to_string(),
+                width: s.new_preset_w,
+                height: s.new_preset_h,
+            });
+            s.new_preset_name.clear();
         }
     });
 
+    if let Some(i) = apply_idx {
+        if let Some(p) = s.presets.get(i).cloned() {
+            toast = Some(report(actions::resize_to(state, p.width, p.height)));
+        }
+    }
+    if let Some(i) = to_delete {
+        if i < s.presets.len() {
+            s.presets.remove(i);
+        }
+    }
+
     ui.horizontal(|ui| {
-        ui.label("自定义");
+        ui.label("自定义尺寸");
         ui.add(egui::DragValue::new(&mut s.custom_w).range(80..=16384).speed(4));
         ui.label("x");
         ui.add(egui::DragValue::new(&mut s.custom_h).range(60..=16384).speed(4));
@@ -305,23 +364,35 @@ pub fn draw(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
         if ui.button("💾 保存设置").clicked() {
             s.apply_to(&mut state.lock().config);
             state.lock().save_config();
+            // 预设变了，顺手把右键菜单里的子菜单刷新一遍
+            if let Some(t) = &snap.target {
+                let presets = state.lock().config.presets.clone();
+                let _ = sysmenu::inject(crate::win::hwnd(t.hwnd), &presets);
+            }
             toast = Some("设置已保存".into());
         }
         if ui.button("重新注入系统菜单").clicked() {
             if let Some(t) = &snap.target {
-                let r = crate::win::sysmenu::inject(crate::win::hwnd(t.hwnd))
+                let presets = state.lock().config.presets.clone();
+                let r = sysmenu::inject(crate::win::hwnd(t.hwnd), &presets)
                     .map(|_| "已重新注入系统菜单条目".to_string());
                 toast = Some(report(r));
             }
         }
         if ui.button("移除系统菜单注入").clicked() {
             if let Some(t) = &snap.target {
-                let r = crate::win::sysmenu::remove(crate::win::hwnd(t.hwnd))
+                let r = sysmenu::remove(crate::win::hwnd(t.hwnd))
                     .map(|_| "已移除系统菜单条目".to_string());
                 toast = Some(report(r));
             }
         }
     });
+
+    ui.label(
+        egui::RichText::new(format!("配置文件: {}", snap.config_path))
+            .small()
+            .weak(),
+    );
 
     if !s.hotkey_help.is_empty() {
         ui.separator();
