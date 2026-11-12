@@ -1807,6 +1807,15 @@ git push origin v1.0.1
   避免 `stable` 漂移导致「本地能编、CI 编不过」。
 * **PowerShell 里拼接文件名必须写 `${tag}_`**：`"$tag_..."` 会把 `tag_` 当成变量名，
   拼接结果变成空字符串 —— 这是一个非常容易踩的坑。
+* **必须静态链接 CRT**：Rust 的 `*-pc-windows-msvc` 目标默认**动态**链接 CRT，
+  产物的 import 表里会出现 `VCRUNTIME140.dll`。这个 DLL 不属于 Windows 自带组件，
+  来自 VC++ 可再发行包 —— 干净系统或没装过运行库的域内机器上会直接启动失败。
+  因此 `.cargo/config.toml` 对两个 MSVC 目标设置了
+  `rustflags = ["-C", "target-feature=+crt-static"]`。
+  workflow 里还有一道守卫：构建后扫描 PE 内容，出现 `VCRUNTIME` / `MSVCP` /
+  `libgcc` / `libwinpthread` / `libstdc++` 就直接失败，防止以后回归。
+  > 验收标准：产物 import 表里只应有 Windows 系统 DLL（kernel32 / user32 /
+  > comctl32 / dwmapi / ole32 / opengl32 …）。
 * `cargo build --release --locked` 保证 CI 用的依赖版本与 `Cargo.lock` 完全一致。
 * `overwrite_files: true`：同一个 tag 重复运行时覆盖已有资产，不会报错。
 * ⚠️ **JSON / YAML 里不要出现任何凭据**；发布用的是 GitHub 自动注入的 `GITHUB_TOKEN`
