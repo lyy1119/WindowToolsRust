@@ -1,0 +1,142 @@
+name: Release
+
+# 打 tag 时自动构建 x64 / ARM64 两个平台的 exe，并发布到 GitHub Release。
+# 推送形如 v1.0.1 的 tag 即可触发，例如：
+#   git tag -a v1.0.1 -m "WindowToolsRust v1.0.1" && git push origin v1.0.1
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# softprops/action-gh-release 需要写 Release 的权限
+permissions:
+  contents: write
+
+env:
+  # 与本地开发一致的 Rust 版本，避免 stable 漂移导致构建结果不同
+  RUST_VERSION: "1.99.0"
+  BIN_NAME: window-tools-rust.exe
+
+jobs:
+  # ---------------------------------------------------------------- 构建
+  build:
+    name: build (${{ matrix.flavor }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      # 一个平台失败不影响另一个继续构建（方便看出是哪个平台的问题）
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            flavor: windows-x86-64
+          - target: aarch64-pc-windows-msvc
+            flavor: windows-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # windows-latest 镜像自带 MSVC 的 ARM64 工具链
+      # （Microsoft.VisualStudio.Component.VC.Tools.ARM64），所以 ARM64 可以直接交叉编译。
+      # 这里用 rustup 直接装指定版本，避免依赖第三方 action 的 tag 语义。
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --no-self-update
+          rustup default $env:RUST_VERSION
+          rustup target add ${{ matrix.target }} --toolchain $env:RUST_VERSION
+          rustc --version
+          rustup target list --installed
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Build release
+        shell: pwsh
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # 产物重命名成发布用的固定格式：WindowToolsRust-<tag>_<flavor>.exe
+      # 注意 PowerShell 里 "${tag}_" 必须加花括号，否则 $tag_ 会被当成变量名。
+      - name: Rename & inspect asset
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $asset = "WindowToolsRust-${tag}_${{ matrix.flavor }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" $asset
+          $item = Get-Item $asset
+          Write-Host "产物: $($item.Name)  大小: $($item.Length) 字节"
+          Get-FileHash $asset -Algorithm SHA256 | Format-List Algorithm, Hash
+          # 记录机器架构，便于确认确实是对应架构的 PE
+          $bytes = [System.IO.File]::ReadAllBytes($asset)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          Write-Host ("PE machine = 0x{0:X4} (0x8664=x64, 0xAA64=ARM64)" -f $machine)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.flavor }}
+          path: WindowToolsRust-*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------- 发布
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # 两个 job 的产物合并到同一个目录
+          merge-multiple: true
+
+      - name: Inspect assets
+        run: |
+          ls -la dist
+          sha256sum dist/*.exe
+
+      - name: Compose release name (vX.Y.Z-YYYYMMDD)
+        id: meta
+        run: |
+          echo "release_name=${{ github.ref_name }}-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # 若该 tag 已有 Release 则更新并补上资产；没有则创建。
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.meta.outputs.release_name }}
+          body: |
+            实现基本功能
+
+            ### 下载
+
+            | 平台 | 文件 |
+            | --- | --- |
+            | Windows x64 | `WindowToolsRust-${{ github.ref_name }}_windows-x86-64.exe` |
+            | Windows ARM64 | `WindowToolsRust-${{ github.ref_name }}_windows-arm64.exe` |
+
+            > 两个文件都是免安装的单文件程序，无运行时依赖（不需要 .NET / VC++ 运行库）。
+            > ARM64 版本为交叉编译产物，尚未在真机上验证，如遇问题请反馈。
+          files: dist/*.exe
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          # 同一 tag 重复运行时覆盖已有资产
+          overwrite_files: true
