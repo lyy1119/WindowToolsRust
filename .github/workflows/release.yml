@@ -84,6 +84,18 @@ jobs:
           $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
           Write-Host ("PE machine = 0x{0:X4} (0x8664=x64, 0xAA64=ARM64)" -f $machine)
 
+          # 守卫：产物必须是「无运行时依赖」的单文件。
+          # 如果这里报错，多半是 .cargo/config.toml 里的 +crt-static 被改掉了
+          # （MSVC 目标默认动态链接 CRT，会依赖 VCRUNTIME140.dll）。
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+          foreach ($bad in @('VCRUNTIME', 'MSVCP', 'libgcc', 'libwinpthread', 'libstdc++')) {
+            if ($ascii.Contains($bad)) {
+              throw "产物依赖了非系统运行时库: $bad —— 检查 .cargo/config.toml 的 +crt-static 配置"
+            }
+          }
+          Write-Host "无运行时库依赖 ✅"
+
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

@@ -1,0 +1,16 @@
+# 让 MSVC 目标的产物**静态链接 CRT**。
+#
+# 原因：Rust 的 *-pc-windows-msvc 目标默认会动态链接 CRT，产物 import 表里会出现
+# VCRUNTIME140.dll —— 这玩意不属于 Windows 自带组件，来自 VC++ 可再发行包。
+# 干净系统 / 域内机器上如果没装过 VC++ 运行库，程序会直接启动失败（找不到 DLL）。
+#
+# 加上 +crt-static 之后，VCRUNTIME140 和 UCRT 都被静态链进来，
+# 产物只依赖 Windows 自带的系统 DLL，真正做成「单文件、无运行时依赖」。
+#
+# 注意：只对 MSVC 目标设置。GNU 目标（x86_64-pc-windows-gnu）本来就是静态的，
+# 不要在这里加，否则会干扰本机的自定义链接器配置。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
