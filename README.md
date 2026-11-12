@@ -5,7 +5,7 @@
 一个类似 [WindowTop](https://github.com/WindowTop/WindowTop-App) 的轻量替代品。
 界面用纯 Rust 的 `egui` 画，Windows 原生能力走 `windows-rs`，**不注入任何目标进程**。
 
-`v1.0.0` · Windows 10/11 x64 · MIT License
+`v1.0.1` · Windows 10/11（x64 / ARM64）· MIT License
 
 ---
 
@@ -40,20 +40,56 @@
 
 ### 系统要求
 
-* Windows 10 / 11，64 位
-* 无运行时依赖，`window-tools-rust.exe` 双击即可运行
+| 架构 | 说明 |
+|---|---|
+| Windows x64 | Windows 10 / 11，主流桌面与笔记本 |
+| **Windows ARM64** | Windows 11 on ARM（骁龙本等）。⚠️ 目前是交叉编译产物，**尚未在真机上验证** |
+
+* 无运行时依赖，双击即可运行（不需要 .NET / VC++ 运行库）
 * 如需操作**以管理员身份运行的窗口**（如任务管理器），本程序也需要以管理员身份运行
 
-### 获取与编译
+### 下载（预编译版）
 
-从源码编译需要 Rust stable（开发时使用 1.99.0）：
+到 [Releases](https://github.com/lyy1119/WindowToolsRust/releases) 页面下载，**免安装、单文件**：
+
+| 平台 | 文件名 |
+|---|---|
+| Windows x64 | `WindowToolsRust-v1.0.1_windows-x86-64.exe` |
+| Windows ARM64 | `WindowToolsRust-v1.0.1_windows-arm64.exe` |
+
+命名规则：`WindowToolsRust-<版本>_windows-<架构>.exe`。
+
+> 这些二进制**由 GitHub Actions 自动构建**：仓库打上 `v*` 形式的 tag 时会自动编译
+> x64 与 ARM64 两个平台并发布到 Release。详见
+> [`.github/workflows/release.yml`](.github/workflows/release.yml)。
+>
+> ARM64 版本是交叉编译产物（GitHub 的 Windows runner 自带 MSVC ARM64 工具链），
+> 尚未在 ARM 真机上跑过。如果你有骁龙本，欢迎反馈问题。
+
+### 从源码编译
+
+需要 Rust stable（开发与 CI 统一使用 1.99.0）：
+
+```powershell
+# 你所在的平台（默认 host target）
+cargo build --release
+
+# 交叉编译到 ARM64（在 x64 Windows 上需要装有 VS 的 ARM64 工具链）
+rustup target add aarch64-pc-windows-msvc
+cargo build --release --target aarch64-pc-windows-msvc
+```
+
+从零开始的完整步骤（含克隆）：
 
 ```powershell
 git clone https://github.com/lyy1119/WindowToolsRust.git
 cd WindowToolsRust
 cargo build --release
-# 产物: target/release/window-tools-rust.exe
+# 产物: target\release\window-tools-rust.exe
 ```
+
+> 在 Linux 上交叉编译（本项目的开发方式）以及产物自检的完整步骤，
+> 见 [DEVELOPMENT.md 第 5 章](DEVELOPMENT.md#5-构建验证与发布)。
 
 Debug 构建会保留控制台窗口并输出日志，方便排查问题：
 

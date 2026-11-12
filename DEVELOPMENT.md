@@ -1777,13 +1777,47 @@ PE 头应为 `MZ` + `PE\0\0`，machine = `0x8664`，subsystem = 2（GUI）/ 3（
 * 提交信息用中文，说明「改了什么 + 为什么」。
 * 每次提交前跑一遍两个 target 的 `cargo check`，保持**零警告**。
 
-## 5.5 v1.0.0 发布清单（尚未执行）
+## 5.5 发布流程（已自动化）
 
-* [ ] 全部功能在 Windows 真机上回归通过
-* [ ] `Cargo.toml` version 已是 `1.0.0`
+发布由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 自动完成，
+**推一个 `v*` 形式的 tag 即可**：
+
+```bash
+git tag -a v1.0.1 -m "WindowToolsRust v1.0.1"
+git push origin v1.0.1
+```
+
+### 工作流做什么
+
+| 阶段 | 内容 |
+|---|---|
+| 触发 | `push` 到任意 `v*` tag |
+| `build` job（matrix） | 在 `windows-latest` 上分别构建 `x86_64-pc-windows-msvc` 与 `aarch64-pc-windows-msvc` |
+| 产物重命名 | `WindowToolsRust-<tag>_windows-x86-64.exe` / `WindowToolsRust-<tag>_windows-arm64.exe` |
+| 产物自检 | 打印文件大小、SHA256、PE 头 machine 字段（`0x8664`=x64 / `0xAA64`=ARM64） |
+| `release` job | 汇总两个产物，创建或更新 Release，名称 `vX.Y.Z-YYYYMMDD` |
+
+### 几个关键设计点
+
+* **ARM64 能交叉编译的前提**：`windows-latest` 镜像自带
+  `Microsoft.VisualStudio.Component.VC.Tools.ARM64`，所以 x64 runner 上可以直接链接 ARM64 产物，
+  不需要额外的 VS 组件安装步骤。如果将来镜像变了导致链接失败，
+  可在 workflow 里加一步安装该组件。
+* **Rust 版本用 `env.RUST_VERSION` 固定为 1.99.0**（通过 rustup 直接安装，不依赖第三方 action 的 tag 语义），
+  避免 `stable` 漂移导致「本地能编、CI 编不过」。
+* **PowerShell 里拼接文件名必须写 `${tag}_`**：`"$tag_..."` 会把 `tag_` 当成变量名，
+  拼接结果变成空字符串 —— 这是一个非常容易踩的坑。
+* `cargo build --release --locked` 保证 CI 用的依赖版本与 `Cargo.lock` 完全一致。
+* `overwrite_files: true`：同一个 tag 重复运行时覆盖已有资产，不会报错。
+* ⚠️ **JSON / YAML 里不要出现任何凭据**；发布用的是 GitHub 自动注入的 `GITHUB_TOKEN`
+  （依赖 workflow 顶部的 `permissions: contents: write`）。
+
+### 发布前人工确认
+
+* [ ] `Cargo.toml` 的 version 与 tag 一致
 * [ ] README / DEVELOPMENT 与代码一致
-* [ ] 准备 exe 图标与版本资源（`.ico` + `build.rs`，目前缺失）
-* [ ] 打 tag `v1.0.0` 并创建 Release（**需要明确指示后再做**）
+* [ ] 全部功能在 Windows 真机上回归通过
+* [ ] （待办）exe 图标与版本资源：`.ico` + `build.rs`，目前缺失
 
 ---
 
