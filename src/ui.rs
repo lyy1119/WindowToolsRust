@@ -101,7 +101,10 @@ impl UiState {
 /// 一次快照，避免在画界面的过程中反复加锁
 struct Snapshot {
     target: Option<TargetWindow>,
-    frame_on: bool,
+    /// 当前**目标窗口**是否已被标记红框（按钮文案用）
+    target_framed: bool,
+    /// 当前总共标记了多少个窗口
+    frame_count: usize,
     topmost: bool,
     resizable: bool,
     elevated: bool,
@@ -118,12 +121,21 @@ fn snapshot(state: &Shared) -> Snapshot {
         .as_ref()
         .map(|t| window::is_resizable(crate::win::hwnd(t.hwnd)))
         .unwrap_or(false);
+    let elevated = st.elevated;
+    drop(st);
+    // 红框状态以 frame 模块为准（支持多窗口同时标记）
+    let target_framed = target
+        .as_ref()
+        .map(|t| frame::is_framed(crate::win::hwnd(t.hwnd)))
+        .unwrap_or(false);
+    let frame_count = frame::count();
     Snapshot {
         target,
-        frame_on: st.frame_on,
+        target_framed,
+        frame_count,
         topmost,
         resizable,
-        elevated: st.elevated,
+        elevated,
     }
 }
 
@@ -266,9 +278,20 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
     // ---------- 窗口操作 ----------
     ui.heading("窗口操作");
     ui.horizontal(|ui| {
-        let frame_label = if snap.frame_on { "🔴 关闭红框" } else { "🔴 标记红框" };
+        let frame_label = if snap.target_framed {
+            "🔴 关闭这个窗口的红框"
+        } else {
+            "🔴 标记红框"
+        };
         if ui.button(frame_label).clicked() {
             toast = Some(report(actions::toggle_frame(state, false)));
+        }
+        if snap.frame_count > 0 {
+            ui.label(
+                egui::RichText::new(format!("（当前共 {} 个窗口被标记）", snap.frame_count))
+                    .small()
+                    .weak(),
+            );
         }
 
         let top_label = if snap.topmost { "取消置顶" } else { "置顶" };
@@ -434,13 +457,12 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
                         st.config.frame_color = rgb;
                         st.config.frame_thickness = th;
                     }
-                    if let Some(t) = &snap.target {
-                        toast = Some(report(
-                            frame::show(crate::win::hwnd(t.hwnd), rgb, th)
-                                .map(|_| "红框样式已更新".to_string()),
-                        ));
-                        state.lock().frame_on = true;
-                    }
+                    // 只更新样式，不新增也不移除任何红框（对所有已标记窗口一起生效）
+                    frame::restyle(rgb, th);
+                    toast = Some(format!(
+                        "红框样式已应用到 {} 个窗口",
+                        frame::count()
+                    ));
                 }
             });
             ui.end_row();
@@ -545,6 +567,9 @@ fn draw_inner(ui: &mut egui::Ui, state: &Shared, s: &mut UiState) {
                     .map(|_| "已移除系统菜单条目".to_string());
                 toast = Some(report(r));
             }
+        }
+        if ui.button("🧹 清除全部红框").clicked() {
+            toast = Some(report(actions::clear_all_frames(state)));
         }
     });
 

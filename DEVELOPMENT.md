@@ -892,133 +892,115 @@ const CANDIDATES: &[(&str, u32)] = &[
 （`lparam` 里塞的是 `&mut Vec` 的裸指针，这是 `EnumWindows` 的经典用法，
 安全性由「只在 `enumerate` 的调用栈内有效」保证。）
 
-## 2.12 `src/win/frame.rs` — 红框覆盖层（396 行）
+## 2.12 `src/win/frame.rs` — 红框覆盖层（560 行）
 
 ### 设计目的
 
-给任意目标窗口套一个红色边框。**不注入目标进程**，方式是自己创建一个
-「只有边框、中间镂空」的置顶窗口，并让它跟随目标窗口。
+给任意窗口套一个红色边框，并且**支持同时标记多个窗口**。
 
-### 实现原理（4 步）
+> 早期版本只有一组全局 `TARGET`/`OVERLAY` 原子量，也就是「同一时刻只能标记一个窗口」。
+> 但「置顶时自动标记红框」天然会作用于多个窗口 —— 于是出现了
+> 「置顶第二个窗口时，第一个窗口的红框消失」的 bug。
+> 现在改成**每个被标记的窗口各自持有一个覆盖层窗口**，互不干扰。
 
-1. 注册一个窗口类 `WindowToolsRust.FrameOverlay`，创建一个 `WS_POPUP` 窗口，
-   带 `WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`；
-2. 用 `SetWindowRgn` 把窗口中心挖空（`CombineRgn(RGN_DIFF)`）→ 中间完全透明、
-   **鼠标可以穿透**（再配合 `WM_NCHITTEST` 返回 `HTTRANSPARENT` 双保险）；
-3. 用 `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, ..., WINEVENT_OUTOFCONTEXT)`
-   跟随目标窗口的移动/缩放。`WINEVENT_OUTOFCONTEXT` 表示**回调在我们自己的进程里执行**，
-   不需要 DLL 注入；
-4. 主线程每帧再调一次 `tick()` 做**兜底轮询**，即使钩子漏事件红框也不会卡住。
+### 实现原理（对每个目标窗口各来一份）
 
-### 静态状态（全部用原子量，因为钩子回调是 `extern "system"` 无法捕获环境）
+1. 创建一个 `WS_POPUP` +
+   `WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT` 的窗口；
+2. 用 `SetWindowRgn` 把中心挖空（`CombineRgn(RGN_DIFF)`）→ 中间完全透明、
+   **鼠标可穿透**（再配合 `WM_NCHITTEST` 返回 `HTTRANSPARENT` 双保险）；
+3. 用 `SetWinEventHook(..., WINEVENT_OUTOFCONTEXT)` 跟随目标窗口移动/缩放。
+   `WINEVENT_OUTOFCONTEXT` 表示**回调在我们自己的进程里执行**，不需要 DLL 注入；
+4. 主线程每帧调用 [`tick`] 做**兜底轮询**，即使钩子漏事件也不会卡住。
 
-| 名称 | 类型 | 说明 |
-|---|---|---|
-| `OVERLAY` | `AtomicIsize` | 覆盖层窗口句柄（0 = 还没创建） |
-| `TARGET` | `AtomicIsize` | 当前被标记的目标窗口句柄（0 = 没有） |
-| `HOOK` | `AtomicIsize` | `SetWinEventHook` 返回的钩子句柄 |
-| `THICKNESS` | `AtomicI32` | 边框粗细 |
-| `BRUSH` | `AtomicIsize` | 画边框用的 `HBRUSH`，换色时重建 |
-| `UPDATING` | `AtomicBool` | **重入保护**：防止 `SetWindowPos` 触发的 LOCATIONCHANGE 回调再次进入更新逻辑 |
-| `SHOWN` | `AtomicBool` | 覆盖层当前是否可见（避免重复 `ShowWindow`） |
-| `LAST_X/Y/W/H` | `AtomicI32` | 上次应用的几何，**用来做变化检测**：几何没变就不调 `SetWindowPos`，大幅减少无谓的系统调用和重绘 |
-| `LAST_Z_TICK` | `AtomicI32` | 上次「重申置顶」的 `GetTickCount` |
-| `COLOR` | `AtomicI32` | 当前红框颜色（RGB 打包） |
+### 钩子的去重策略
 
-常量：`OVERLAY_CLASS`（类名）、`UNSET = i32::MIN`（几何缓存未初始化）、`Z_REASSERT_MS = 1000`。
+`SetWinEventHook` **只能按进程/线程过滤，不能按窗口过滤**。
+所以这里按「被标记窗口所属的 pid」去重安装钩子：同一个进程的多个窗口共用一个钩子。
+钩子回调里先按窗口句柄做一次快速过滤，不属于我们的窗口直接返回。
 
-### 函数
+### 数据结构
 
-#### `pub fn init()`
+```rust
+struct Frame {          // 单个被标记窗口的覆盖层
+    overlay: isize,      // 覆盖层窗口句柄
+    last_x/last_y/last_w/last_h: i32,  // 上次几何，用于变化检测
+    shown: bool,         // 覆盖层当前是否可见
+    last_z_tick: i32,    // 上次「重申置顶」的 GetTickCount
+}
+impl Frame { fn new(overlay) -> Self; fn invalidate(&mut self); }
 
-预创建覆盖层窗口，避免第一次显示时有可见延迟。失败只记 `log::warn!`。
-
-#### `pub fn is_active() -> bool` / `pub fn active_target() -> Option<isize>`
-
-`TARGET != 0` / 返回 `TARGET`。前者被 `App::logic` 用来决定刷新率；
-后者被 `actions::toggle_frame_for` 用来判断「是不是在给同一个窗口切换红框」。
-
-#### `pub fn show(target: HWND, rgb: [u8; 3], thickness: i32) -> Result<()>`
-
-1. 校验目标窗口有效；
-2. `set_color(rgb)`（换色时重建画刷并删掉旧的）、`THICKNESS.store(clamp(1,32))`；
-3. `ensure_overlay()` 保证覆盖层存在；
-4. **`unhook()` 先卸掉旧钩子** —— 钩子是按目标 pid 过滤的，换目标必须重装；
-5. `SetWinEventHook(EVENT_OBJECT_DESTROY .. EVENT_OBJECT_LOCATIONCHANGE, pid, 0,
-   WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)`；失败只 warn（还有轮询兜底）；
-6. `TARGET.store(...)`、`reset_cache()`、`InvalidateRect`、`refresh()`。
-
-#### `pub fn hide()`
-
-卸钩子、`TARGET = 0`、清缓存、`ShowWindow(SW_HIDE)`、`SHOWN = false`。
-
-#### `fn reset_cache()`
-
-把 `LAST_X/Y/W/H` 和 `LAST_Z_TICK` 全部设成 `UNSET`，让下一次 `refresh` 强制应用一次几何。
-
-#### `pub fn refresh()`
-
-带重入保护的入口：`UPDATING.swap(true)` 成功才执行 `refresh_inner()`，结束后复位。
-
-#### `pub fn tick()`
-
-`is_active()` 时调 `refresh()`。由 `App::logic` 每帧调用，是「兜底跟随」的来源。
-
-#### `unsafe fn refresh_inner()`（核心）
-
-```text
-1. TARGET / OVERLAY 任一为 0 → 直接返回
-2. 目标窗口已销毁 → hide() 并返回
-3. 目标不可见或最小化 → 隐藏覆盖层并返回（只在 SHOWN 为真时才真的调 ShowWindow）
-4. visible_frame_rect(target) 取可见帧边界
-5. 按 thickness 向外扩：(x, y, w, h)
-6. 尺寸变了 → apply_region() 重做镂空区域 + 更新 LAST_W/H
-7. 位置/尺寸变了、或还没显示 → SetWindowPos(HWND_TOPMOST, x, y, w, h,
-   SWP_NOACTIVATE|SWP_SHOWWINDOW) 并更新缓存，然后 return
-8. 几何没变 → 距上次「重申置顶」超过 1 秒时，用
-   SetWindowPos(HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE) 把 z-order 顶回去
+struct FrameState {
+    frames: HashMap<isize, Frame>,  // key = 目标窗口句柄
+    hooks:  HashMap<u32, isize>,    // pid -> WinEvent 钩子句柄
+    rgb: [u8; 3],                   // 当前红框颜色
+    thickness: i32,                 // 当前边框粗细
+    class_ok: bool,                 // 窗口类是否已注册
+}
 ```
 
-* **第 8 步是必需的**：目标窗口自己变成 TOPMOST 时会被排到置顶层最上方，
-  我们的覆盖层就会排在它下面。定期重申一次保证红框始终压在窗口上面。
-* **第 7 步的「几何没变就不动」很重要**：目标窗口静止时每秒最多只有一次系统调用，
+| 全局静态 | 类型 | 说明 |
+|---|---|---|
+| `STATE` | `OnceLock<Mutex<FrameState>>` | 全部状态。所有操作都在主线程，用 Mutex 保护 |
+| `BRUSH` | `AtomicIsize` | 画笔。**刻意不放进 `FrameState`**，原因见下方「死锁陷阱」 |
+
+常量：`OVERLAY_CLASS`（类名）、`UNSET = i32::MIN`（几何缓存未初始化）、
+`Z_REASSERT_MS = 1000`（z-order 兜底重申间隔）。
+
+### ⚠️ 死锁陷阱（改这个文件前必读）
+
+`ShowWindow` / `DestroyWindow` / `SetWindowPos` 等调用**可能同步派发窗口消息**
+到我们自己的 `overlay_proc`。如果在 `WM_PAINT` 里去 `STATE.lock()`，
+一旦这层调用发生在「已经持有锁」的代码路径里，就会直接死锁
+（`parking_lot::Mutex` **不可重入**）。
+
+所以：**画笔存在 `BRUSH` 这个原子量里，`WM_PAINT` 只读原子量，绝不加锁。**
+
+### 公开 API
+
+| 函数 | 说明 |
+|---|---|
+| `init()` | 注册覆盖层窗口类（启动时一次）。不预创建窗口，覆盖层按需为每个目标创建 |
+| `has_any() -> bool` | 是否有任意窗口被标记（决定主循环刷新率、托盘勾选） |
+| `count() -> usize` | 当前被标记的窗口数量 |
+| `is_framed(HWND) -> bool` | 这个窗口是否被标记 |
+| `show(HWND, rgb, thickness) -> Result<()>` | 给该窗口加红框（已加则只更新样式），**不影响其它窗口** |
+| `restyle(rgb, thickness)` | 只更新样式，不新增/不移除任何红框 |
+| `remove(HWND)` | 移除该窗口的红框 |
+| `remove_all()` | 移除所有红框 |
+| `toggle(HWND, rgb, thickness) -> Result<bool>` | 只切换**这一个**窗口，返回切换后是否有框 |
+| `tick()` | 主线程每帧调用：清理已销毁目标 + 刷新所有几何 |
+
+### 内部函数
+
+| 函数 | 说明 |
+|---|---|
+| `ensure_class(&mut FrameState)` | 注册窗口类（幂等，用 `class_ok` 标记） |
+| `apply_style(&mut FrameState, rgb, thickness)` | 换色时重建 `BRUSH` 并让所有覆盖层重绘；换粗细时让所有几何缓存失效 |
+| `destroy_entry(&mut FrameState, key)` | 销毁某个覆盖层并移除记录 |
+| `sync_hooks(&mut FrameState)` | 让「已装钩子」与「被标记窗口的 pid 集合」保持一致（装缺的、卸多余的） |
+| `refresh_entry(&mut FrameState, key)` | 刷新单个窗口的几何（见下） |
+| `visible_frame_rect(HWND) -> Option<RECT>` | 取目标**可见**帧边界（`DWMWA_EXTENDED_FRAME_BOUNDS`，失败退回 `GetWindowRect`） |
+| `apply_region(overlay, w, h, th)` | 把覆盖层挖成「回」字形 |
+
+#### `refresh_entry` 的逻辑（核心）
+
+```text
+1. 覆盖层有效？目标仍存在/可见/未最小化？否则隐藏并返回
+2. visible_frame_rect(target) 取可见边界
+3. 按 thickness 向外扩成 (x, y, w, h)
+4. 尺寸变了 → apply_region() 重做镂空区域 + 更新 last_w/last_h
+5. 位置或尺寸变了、或还没显示 → SetWindowPos(HWND_TOPMOST, x,y,w,h,
+   SWP_NOACTIVATE|SWP_SHOWWINDOW) 并更新缓存，然后 return
+6. 几何没变 → 距上次「重申置顶」超过 1 秒就再重申一次（SWP_NOMOVE|SWP_NOSIZE）
+```
+
+* 第 5 步的「几何没变就不动」很重要：目标静止时每秒最多一次系统调用，
   否则 30 Hz 的 `SetWindowPos` 会造成明显的 CPU 占用和闪烁。
+* 第 6 步是必需的：目标窗口自己变成 TOPMOST 后会被排到置顶层最上方，
+  我们的覆盖层就会排在它下面，红框会被它自己的边框画掉。
 
-#### `unsafe fn visible_frame_rect(target: HWND) -> Option<RECT>`
-
-**这是红框能正确跟随的关键函数。**
-
-* 先试 `DwmGetWindowAttribute(target, DWMWA_EXTENDED_FRAME_BOUNDS, ...)`，
-  拿到的是**用户肉眼看到的**窗口边缘（物理像素）；
-* 取不到（返回错误或矩形无效）时退回 `GetWindowRect`。
-
-> **为什么不能用 `GetWindowRect`**：它对 DWM 合成窗口返回的是**含一圈不可见缩放边框**的外框，
-> 比可见边缘大（普通窗口每边约 7~8 px）。对着它向外扩 3 px 画框，
-> 红框实际落在目标窗口**自身非客户区的绘制范围内**；目标窗口一旦置顶排到我们上面，
-> 红框就被它自己的边框画掉了 —— 表现出来就是「红框不见了 / 不跟随」。
-
-#### `fn apply_region(overlay: HWND, w: i32, h: i32, th: i32)`
-
-`CreateRectRgn(0,0,w,h)` + `CreateRectRgn(th,th,w-th,h-th)`，
-`CombineRgn(RGN_DIFF)` 得到「回」字形区域，`SetWindowRgn` 应用。
-**`SetWindowRgn` 成功后区域归系统所有，不要再自己删 outer**；只删 inner。
-
-#### `fn set_color(rgb: [u8; 3])`
-
-颜色没变且画刷存在时直接返回；否则删掉旧画刷、`CreateSolidBrush` 建新的。
-（画刷只在 `WM_PAINT` 里用，删旧的是安全的。）
-
-#### `fn unhook()`
-
-`UnhookWinEvent` 并清零 `HOOK`。
-
-#### `unsafe fn ensure_overlay() -> Result<HWND>`
-
-覆盖层已存在且有效则直接返回。否则 `RegisterClassW`（已注册时返回 0，忽略）+
-`CreateWindowExW`。**类背景刷设为 NULL**，背景完全由 `WM_PAINT` 自己画 ——
-这样换色重建画刷时不会留下悬空句柄被 `DefWindowProc` 使用。
-
-#### `unsafe extern "system" fn overlay_proc(...)`（覆盖层窗口过程）
+### 窗口过程
 
 | 消息 | 处理 |
 |---|---|
@@ -1027,15 +1009,12 @@ const CANDIDATES: &[(&str, u32)] = &[
 | `WM_PAINT` | `BeginPaint` → `GetClientRect` → `FillRect(BRUSH)` → `EndPaint` |
 | 其它 | `DefWindowProcW` |
 
-#### `unsafe extern "system" fn win_event_proc(...)`（WinEvent 回调）
+### WinEvent 回调
 
-1. 只要 `id_object == OBJID_WINDOW(0)` 且 `id_child == CHILDID_SELF(0)` 的事件（窗口对象本身）；
-2. 句柄必须等于 `TARGET`；
-3. `EVENT_OBJECT_LOCATIONCHANGE` → `refresh()`；
-   `EVENT_OBJECT_DESTROY` → `hide()` 并记日志。
-
-> 这个回调在**主线程**执行（out-of-context 钩子的回调被投递到安装线程的消息队列），
-> 所以它可以直接读写那些原子量，不需要额外同步。
+1. 只要 `id_object == OBJID_WINDOW(0)` 且 `id_child == CHILDID_SELF(0)` 的事件；
+2. 按窗口句柄快速过滤：不在 `frames` 里就返回（钩子是按进程装的，同进程其它窗口的事件也会进来）；
+3. `EVENT_OBJECT_LOCATIONCHANGE` → `refresh_entry`；
+   `EVENT_OBJECT_DESTROY` → `destroy_entry` + `sync_hooks`。
 
 ## 2.13 `src/win/audio.rs` — 按进程静音（477 行）
 
@@ -1547,7 +1526,7 @@ Windows 对「操作别人的窗口」有明确的边界，整个项目的架构
 
 ### 由此推出的三个核心设计
 
-1. **红框** → 自己创建一个独立的覆盖层窗口（[2.12](#212-srcwinframers--红框覆盖层396-行)）；
+1. **红框** → 自己创建一个独立的覆盖层窗口（[2.12](#212-srcwinframers--红框覆盖层560-行)）；
 2. **菜单点击捕获** → `WH_MOUSE_LL` + `GetMenuItemRect` 命中测试（[2.14](#214-srcwinsysmenurs--系统菜单注入与点击捕获359-行)）；
 3. **自绘标题栏的程序** → 只能靠快捷键 / 托盘 / 界面按钮，这是系统限制不是 bug。
 

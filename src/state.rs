@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::win::audio::AudioService;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,13 +35,12 @@ pub struct AppState {
     pub config: Config,
     pub config_path: PathBuf,
     pub target: Option<TargetWindow>,
-    pub frame_on: bool,
     pub audio: AudioService,
     /// 当前已经注入过系统菜单的窗口 hwnd
     pub menu_injected: Option<isize>,
-    /// 因为「置顶时自动标记红框」而加上的红框属于哪个窗口。
+    /// 因为「置顶时自动标记红框」而加上的红框**属于哪些窗口**（可以有多个）。
     /// 只记录自动加上的那种，取消置顶时才会自动移除，不会误删用户手动标的红框。
-    pub frame_auto_for_topmost: Option<isize>,
+    pub frame_auto_for_topmost: HashSet<isize>,
     /// 界面改了快捷键后置位，由 App 在下一帧真正重新注册
     pub pending_hotkey_apply: bool,
     /// 界面要求真正退出（例如点了「以管理员身份重启」）。
@@ -60,10 +60,9 @@ impl AppState {
             config,
             config_path,
             target: None,
-            frame_on: false,
             audio: AudioService::spawn(),
             menu_injected: None,
-            frame_auto_for_topmost: None,
+            frame_auto_for_topmost: HashSet::new(),
             pending_hotkey_apply: false,
             pending_quit: false,
             log: Vec::new(),

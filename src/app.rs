@@ -282,18 +282,18 @@ impl App {
     /// 托盘勾选状态跟随实际状态
     fn sync_tray_state(&mut self) {
         let Some(tray) = self.tray.as_ref() else { return };
-        let (frame_on, topmost) = {
+        let topmost = {
             let st = self.state.lock();
-            let topmost = st
-                .target
+            st.target
                 .as_ref()
                 .map(|t| window::is_topmost(hwnd(t.hwnd)))
-                .unwrap_or(false);
-            (st.frame_on, topmost)
+                .unwrap_or(false)
         };
-        if self.last_frame_flag != Some(frame_on) {
-            tray.frame_item.set_checked(frame_on);
-            self.last_frame_flag = Some(frame_on);
+        // 托盘上的「标记红框」勾选框表示「当前是否有任意窗口被标记」
+        let frame_any = frame::has_any();
+        if self.last_frame_flag != Some(frame_any) {
+            tray.frame_item.set_checked(frame_any);
+            self.last_frame_flag = Some(frame_any);
         }
         if self.last_topmost_flag != Some(topmost) {
             tray.topmost_item.set_checked(topmost);
@@ -317,7 +317,7 @@ impl eframe::App for App {
         // 红框跟随的兜底轮询：即使 WinEvent 钩子漏事件，红框也不会卡住不动。
         // 有红框时提高刷新率让跟随更跟手，没有时降到 4~5Hz 省 CPU。
         frame::tick();
-        let interval = if frame::is_active() {
+        let interval = if frame::has_any() {
             Duration::from_millis(33)
         } else {
             Duration::from_millis(400)

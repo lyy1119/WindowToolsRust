@@ -96,13 +96,10 @@ pub fn set_target(
 
     {
         let mut st = state.lock();
-        let changed = st.target.as_ref().map(|t| t.hwnd) != Some(info.hwnd);
         st.target = Some(info.clone());
         st.menu_injected = None;
-        if changed {
-            // 换窗口了，之前「为置顶自动加的红框」的记录作废
-            st.frame_auto_for_topmost = None;
-        }
+        // 注意：换目标**不会**清空 frame_auto_for_topmost，
+        // 因为置顶可以同时作用于多个窗口，它们的自动红框记录必须各自保留。
         st.log(format!("[{source}] 已选中窗口: {}", info.short_label()));
     }
 
@@ -111,7 +108,8 @@ pub fn set_target(
             // Firefox、PotPlayer 皮肤模式这类自绘标题栏的程序根本没有系统菜单，
             // 注入是不可能成功的 —— 这不是错误，跳过即可，用快捷键操作。
             state.lock().log(
-                "该窗口没有系统菜单（自绘标题栏的程序，如 Firefox / PotPlayer 皮肤模式），                 无法注入右键菜单条目；请直接用快捷键或界面按钮操作",
+                "该窗口没有系统菜单（自绘标题栏的程序，如 Firefox / PotPlayer 皮肤模式），\
+                 无法注入右键菜单条目；请直接用快捷键或界面按钮操作",
             );
         } else {
             match sysmenu::inject(h, &presets) {
@@ -126,9 +124,8 @@ pub fn set_target(
     }
 
     if want_frame {
-        match frame::show(h, rgb, thickness) {
-            Ok(()) => state.lock().frame_on = true,
-            Err(e) => state.lock().log(format!("显示红框失败: {e:#}")),
+        if let Err(e) = frame::show(h, rgb, thickness) {
+            state.lock().log(format!("显示红框失败: {e:#}"));
         }
     }
 
@@ -158,88 +155,89 @@ pub fn pick_foreground(state: &Shared) -> Result<TargetWindow> {
     set_target(state, h, "前台窗口", frame)
 }
 
-/// 以某个窗口为目标切换红框（系统菜单「标记红框」用）
+/// 切换**指定窗口**的红框（系统菜单「标记红框」用）。
+///
+/// 只影响这一个窗口，其它窗口的红框保持原样。
+/// 手动切换会把它从「置顶自动加的红框」记录里移除 —— 从此它算用户自己标的。
 pub fn toggle_frame_for(state: &Shared, h: HWND) -> Result<String> {
-    if frame::active_target() == Some(hwnd_i(h)) {
-        frame::hide();
-        {
-            let mut st = state.lock();
-            st.frame_on = false;
-            st.frame_auto_for_topmost = None;
-        }
-        let msg = format!("已关闭 {} 的红框", window::title(h));
-        state.lock().log(msg.clone());
-        return Ok(msg);
-    }
     let (rgb, th) = {
         let st = state.lock();
         (st.config.frame_color, st.config.frame_thickness)
     };
-    frame::show(h, rgb, th)?;
+    let on = frame::toggle(h, rgb, th)?;
     {
         let mut st = state.lock();
-        st.frame_on = true;
-        // 手动标记的红框不属于「置顶自动加的那一个」
-        st.frame_auto_for_topmost = None;
+        st.frame_auto_for_topmost.remove(&hwnd_i(h));
     }
-    let msg = format!("已标记 {} 的红框", window::title(h));
+    let title = window::title(h);
+    let msg = if on {
+        format!("已标记 {title} 的红框")
+    } else {
+        format!("已关闭 {title} 的红框")
+    };
     state.lock().log(msg.clone());
     Ok(msg)
 }
 
-/// 切换红框。
+/// 切换红框（GUI / 托盘 / 热键用）。
 ///
-/// `prefer_foreground = true` 时作用于当前前台窗口，并且是「对这个窗口」切换，
-/// 不会因为别的窗口上已经有红框就把红框收掉。
+/// 作用于 `resolve_target` 解析出的那个窗口，**只切换这一个**；
+/// 别的窗口上已有的红框不会被收掉。
 pub fn toggle_frame(state: &Shared, prefer_foreground: bool) -> Result<String> {
-    if prefer_foreground {
-        let (h, _) = resolve_target(state, true)?;
-        return toggle_frame_for(state, h);
-    }
-    if frame::is_active() {
-        frame::hide();
-        {
-            let mut st = state.lock();
-            st.frame_on = false;
-            st.frame_auto_for_topmost = None;
-        }
-        return Ok("已关闭红框".into());
-    }
-    let (h, _) = require_target(state)?;
+    let (h, _) = resolve_target(state, prefer_foreground)?;
     toggle_frame_for(state, h)
+}
+
+/// 清除所有窗口的红框。
+pub fn clear_all_frames(state: &Shared) -> Result<String> {
+    let n = frame::count();
+    frame::remove_all();
+    state.lock().frame_auto_for_topmost.clear();
+    let msg = if n == 0 {
+        "当前没有红框".to_string()
+    } else {
+        format!("已清除 {n} 个窗口的红框")
+    };
+    state.lock().log(msg.clone());
+    Ok(msg)
 }
 
 pub fn toggle_topmost(state: &Shared, prefer_foreground: bool) -> Result<String> {
     let (h, info) = resolve_target(state, prefer_foreground)?;
     let on = window::toggle_topmost(h)?;
 
-    // 「置顶时自动标记红框」：这是为了让人一眼看出窗口被钉在最上面了。
-    // 只记录我们自动加的那一个，取消置顶时只移除它，不碰用户手动标的红框。
+    // 「置顶时自动标记红框」：让人一眼看出这个窗口被钉在最上面了。
+    // 每个窗口**各自**记录「我这个红框是置顶时自动加的」，
+    // 取消置顶时只移除自己那个，不会动其它窗口的红框，也不碰用户手动标的红框。
+    let key = hwnd_i(h);
+    // 清掉已经不再对应任何红框的旧记录（窗口销毁 / 句柄被复用的极端情况）
+    prune_auto_records(state);
     let mut suffix = String::new();
     if on {
-        let auto = state.lock().config.auto_frame_on_topmost;
-        if auto && frame::active_target() != Some(hwnd_i(h)) {
-            let (rgb, th) = {
-                let st = state.lock();
-                (st.config.frame_color, st.config.frame_thickness)
-            };
+        let (auto, rgb, th) = {
+            let st = state.lock();
+            (
+                st.config.auto_frame_on_topmost,
+                st.config.frame_color,
+                st.config.frame_thickness,
+            )
+        };
+        if auto && !frame::is_framed(h) {
             match frame::show(h, rgb, th) {
                 Ok(()) => {
-                    let mut st = state.lock();
-                    st.frame_on = true;
-                    st.frame_auto_for_topmost = Some(hwnd_i(h));
+                    state.lock().frame_auto_for_topmost.insert(key);
                     suffix = "，并已自动标记红框".into();
                 }
                 Err(e) => state.lock().log(format!("自动标记红框失败: {e:#}")),
             }
         }
     } else {
-        let auto_hwnd = state.lock().frame_auto_for_topmost;
-        if auto_hwnd == Some(hwnd_i(h)) {
-            frame::hide();
+        let was_auto = {
             let mut st = state.lock();
-            st.frame_on = false;
-            st.frame_auto_for_topmost = None;
+            st.frame_auto_for_topmost.remove(&key)
+        };
+        if was_auto {
+            frame::remove(h);
             suffix = "，并已移除自动标记的红框".into();
         }
     }
@@ -332,6 +330,22 @@ pub fn restart_elevated(state: &Shared) -> Result<()> {
             }
             Err(e)
         }
+    }
+}
+
+/// 清理 `frame_auto_for_topmost` 里「记录的窗口已经没有红框」的过期条目。
+///
+/// 锁顺序：先 `state` 再 `frame`。frame 模块内部从不反向索取 `state`，因此不会死锁。
+fn prune_auto_records(state: &Shared) {
+    let mut st = state.lock();
+    let stale: Vec<isize> = st
+        .frame_auto_for_topmost
+        .iter()
+        .copied()
+        .filter(|k| !frame::is_framed(hwnd(*k)))
+        .collect();
+    for k in stale {
+        st.frame_auto_for_topmost.remove(&k);
     }
 }
 
