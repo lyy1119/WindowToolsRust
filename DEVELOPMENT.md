@@ -926,7 +926,8 @@ struct Frame {          // 单个被标记窗口的覆盖层
     overlay: isize,      // 覆盖层窗口句柄
     last_x/last_y/last_w/last_h: i32,  // 上次几何，用于变化检测
     shown: bool,         // 覆盖层当前是否可见
-    last_z_tick: i32,    // 上次「重申置顶」的 GetTickCount
+    topmost: Option<bool>,  // 覆盖层当前的 topmost 状态（None=未同步过）
+    last_z_tick: i32,       // 上次修正 z-order 的 GetTickCount
 }
 impl Frame { fn new(overlay) -> Self; fn invalidate(&mut self); }
 
@@ -992,13 +993,39 @@ struct FrameState {
 4. 尺寸变了 → apply_region() 重做镂空区域 + 更新 last_w/last_h
 5. 位置或尺寸变了、或还没显示 → SetWindowPos(HWND_TOPMOST, x,y,w,h,
    SWP_NOACTIVATE|SWP_SHOWWINDOW) 并更新缓存，然后 return
-6. 几何没变 → 距上次「重申置顶」超过 1 秒就再重申一次（SWP_NOMOVE|SWP_NOSIZE）
+6. 几何没变 → 用 GW_HWNDPREV 校验「覆盖层是否紧贴在目标上方」，不成立才重插
+   （带 60ms 下限，避免某次没生效时每帧重试）
 ```
 
 * 第 5 步的「几何没变就不动」很重要：目标静止时每秒最多一次系统调用，
   否则 30 Hz 的 `SetWindowPos` 会造成明显的 CPU 占用和闪烁。
-* 第 6 步是必需的：目标窗口自己变成 TOPMOST 后会被排到置顶层最上方，
-  我们的覆盖层就会排在它下面，红框会被它自己的边框画掉。
+* 第 6 步的校验是廉价的（一次 `GetWindow`），只在顺序真的错了才动手。
+
+### z-order 不变式：覆盖层紧贴在自己目标的正上方
+
+这是多窗口版本最关键的一条设计，**改动前务必理解**：
+
+> **每个覆盖层在 z 序里紧挨在自己那个目标窗口的上方一格。**
+
+由此自然得到符合直觉的遮挡关系：谁盖住了目标窗口，就一起盖住它的红框。
+
+反过来，如果把覆盖层一律做成 `WS_EX_TOPMOST`（早期版本就是这么做的），
+同时标记多个窗口时红框会全部浮在所有窗口之上 —— 你点击窗口 A 让它盖住窗口 B 时，
+B 的红框仍然画在 A 的前面，看得出来但不合理。
+
+实现上要注意两件事：
+
+1. **topmost 状态必须跟随目标**。Windows 强制「置顶窗口」整体高于「普通窗口」，
+   普通窗口无法被放到置顶窗口之上。所以目标是 TOPMOST 时覆盖层也必须置顶，
+   否则红框会掉到目标窗口下面（看不见）；目标取消置顶后要及时降回普通层。
+   代码里用 `Frame.topmost: Option<bool>` 跟踪，变化时先 `SetWindowPos(HWND_TOPMOST|
+   HWND_NOTOPMOST)` 换带，再重新插到目标上方。
+2. **用 `GetWindow(target, GW_HWNDPREV) == overlay` 校验**。
+   `GW_HWNDPREV` 返回「压在目标上面的那个窗口」；如果它不是我们的覆盖层，
+   说明 z 序变了（典型场景：用户点了另一个窗口），下一帧就把覆盖层挪回去。
+
+> 因此覆盖层创建时**不带 `WS_EX_TOPMOST`**，其置顶与否完全由
+> `refresh_entry` 按目标窗口的实时状态决定。
 
 ### 窗口过程
 
@@ -1537,7 +1564,7 @@ Windows 对「操作别人的窗口」有明确的边界，整个项目的架构
 | # | 坑 | 症状 | 处理 |
 |---|---|---|---|
 | 1 | 用 `GetWindowRect` 当边界 | 红框落在目标窗口自身的非客户区绘制范围内，目标窗口一旦置顶排到上层，红框被它自己的边框画掉 → **看起来像红框不动了/消失了** | 改用 `DWMWA_EXTENDED_FRAME_BOUNDS`（可见帧边界）再向外扩 |
-| 2 | z-order 被抢 | 目标窗口自己变成 TOPMOST 后排到置顶层最上方，压住覆盖层 | 几何变化时重新插入 `HWND_TOPMOST`；另加每秒一次兜底重申 |
+| 2 | z-order 不对 | ① 目标自己置顶后排到最上方，压住覆盖层；② 所有覆盖层都强制 TOPMOST，导致被遮挡窗口的红框仍画在前面 | 覆盖层的 topmost 状态**跟随目标**，并用 `GetWindow(target, GW_HWNDPREV)` 校验「紧贴在目标上方一格」，不对就重插 |
 | 3 | 进程是 DPI-unaware | 125%/150% 缩放或混合 DPI 多显示器下坐标被虚拟化缩放，红框整体偏移 | `main()` 第一行调 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` |
 | 4 | 只靠 WinEvent 钩子 | 钩子漏事件时红框卡住不动 | 主线程每帧 `frame::tick()` 兜底轮询（有红框时 33 ms 一次） |
 

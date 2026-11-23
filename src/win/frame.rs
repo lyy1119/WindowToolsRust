@@ -5,12 +5,28 @@
 //! 因为「置顶自动加红框」本来就是会作用于多个窗口的功能。）
 //!
 //! 实现原理（对每个目标窗口各来一份）：
-//!   1. 创建一个 `WS_POPUP` + `WS_EX_TOPMOST|TOOLWINDOW|NOACTIVATE|TRANSPARENT` 的窗口；
+//!   1. 创建一个 `WS_POPUP` + `WS_EX_TOOLWINDOW|NOACTIVATE|TRANSPARENT` 的窗口
+//!      （**刻意不带 `WS_EX_TOPMOST`**，见下面的 z-order 说明）；
 //!   2. 用 `SetWindowRgn` 挖空中心（`CombineRgn(RGN_DIFF)`），中间透明且鼠标可穿透
 //!      （再配合 `WM_NCHITTEST` 返回 `HTTRANSPARENT` 双保险）；
 //!   3. 用 `SetWinEventHook(..., WINEVENT_OUTOFCONTEXT)` 跟随目标窗口移动/缩放
 //!      （回调在我们自己的进程里执行，**不需要 DLL 注入**）；
 //!   4. 主线程每帧调 [`tick`] 做兜底轮询，即使钩子漏事件也不会卡住。
+//!
+//! ## z-order：覆盖层必须紧贴在自己那个目标窗口的正上方
+//!
+//! 覆盖层**不能**无条件做成 TOPMOST。否则同时标记多个窗口时，红框会浮在所有窗口之上：
+//! 你点击窗口 A 让它盖住窗口 B 时，B 的红框仍然画在 A 的前面 —— 这不符合直觉。
+//!
+//! 正确做法是维持一条不变式：**每个覆盖层在 z 序里紧挨在自己目标窗口的上方一格**。
+//! 这样谁盖住了目标窗口，就自然一起盖住它的红框。
+//!
+//! 实现上有两个要点：
+//!   * **覆盖层的 topmost 状态必须跟目标一致**：Windows 强制「置顶窗口」整体高于
+//!     「普通窗口」，普通窗口无法被放到置顶窗口之上。所以目标是 TOPMOST 时覆盖层也得是，
+//!     否则红框会跑到目标窗口下面去（看不见）。目标取消置顶后要及时降回普通层。
+//!   * **靠 `GW_HWNDPREV` 校验**：每帧检查 `GetWindow(target, GW_HWNDPREV) == overlay`，
+//!     不成立就重新插到目标上方。用户点击切换前后顺序后，红框会在下一帧跟过去。
 //!
 //! 钩子管理：`SetWinEventHook` 只能按**进程**过滤，不能按窗口过滤。
 //! 所以这里按「被标记窗口所属的 pid」去重安装钩子 —— 同一个进程的多个窗口共用一个钩子。
@@ -35,18 +51,22 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, IsIconic, IsWindow,
     IsWindowVisible, RegisterClassW, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, GetWindow, GW_HWNDPREV, HTTRANSPARENT,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::win::{hwnd, hwnd_i, window};
 
 const OVERLAY_CLASS: PCWSTR = w!("WindowToolsRust.FrameOverlay");
 const UNSET: i32 = i32::MIN;
-/// z-order 兜底重申的最小间隔（毫秒）
-const Z_REASSERT_MS: i32 = 1000;
+/// 修正 z-order 的最小间隔（毫秒）。
+///
+/// 只在「`GW_HWNDPREV` 校验发现顺序不对」时才动手，所以正常情况下零开销；
+/// 加这个下限是为了万一某次 SetWindowPos 没生效，不至于每帧反复重试。
+const Z_FIX_MS: i32 = 60;
 
 /// 单个被标记窗口的覆盖层
 struct Frame {
@@ -59,7 +79,9 @@ struct Frame {
     last_h: i32,
     /// 覆盖层当前是否可见
     shown: bool,
-    /// 上次「重申置顶」的 GetTickCount
+    /// 覆盖层当前的 topmost 状态（None = 还没同步过），用来跟随目标窗口所在的 z 序带
+    topmost: Option<bool>,
+    /// 上次修正 z-order 的 GetTickCount
     last_z_tick: i32,
 }
 
@@ -72,6 +94,7 @@ impl Frame {
             last_w: UNSET,
             last_h: UNSET,
             shown: false,
+            topmost: None,
             last_z_tick: UNSET,
         }
     }
@@ -401,12 +424,33 @@ fn refresh_entry(st: &mut FrameState, key: isize) {
             f.last_h = h;
         }
 
-        if moved || size_changed || !f.shown {
+        // (1) 先让覆盖层待在**和目标同一个 z 序带**里：
+        //     目标是置顶窗口 -> 覆盖层也必须置顶；目标变回普通窗口 -> 覆盖层也要降下来。
+        //     否则 Windows 会强制把普通窗口排在所有置顶窗口之下，红框就跑到目标下面去了。
+        let target_topmost = window::is_topmost(target);
+        let mut need_reinsert = false;
+        if f.topmost != Some(target_topmost) {
+            let band = if target_topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            let _ = SetWindowPos(
+                overlay,
+                Some(band),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            f.topmost = Some(target_topmost);
+            need_reinsert = true;
+        }
+
+        // (2) 位置/尺寸变了、或刚切换过 z 序带 -> 重新插到目标窗口的正上方一格
+        if moved || size_changed || !f.shown || need_reinsert {
             f.last_x = x;
             f.last_y = y;
             let _ = SetWindowPos(
                 overlay,
-                Some(HWND_TOPMOST),
+                Some(target),
                 x,
                 y,
                 w,
@@ -414,23 +458,29 @@ fn refresh_entry(st: &mut FrameState, key: isize) {
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             f.shown = true;
+            f.last_z_tick = GetTickCount() as i32;
             return;
         }
 
-        // 几何没变：周期性地把 z-order 顶回置顶带最上方。
-        // 否则目标窗口自己变成 TOPMOST 后会压住我们的红框。
-        let now = GetTickCount() as i32;
-        if f.last_z_tick == UNSET || now.wrapping_sub(f.last_z_tick) >= Z_REASSERT_MS {
-            f.last_z_tick = now;
-            let _ = SetWindowPos(
-                overlay,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+        // (3) 几何没变时校验 z-order：覆盖层必须紧挨在目标上方
+        //     （GW_HWNDPREV = 该窗口在 z 序里的前一个窗口，也就是压在它上面的那个）。
+        //     用户点击切换前后顺序后，这里会在下一帧把红框挪回去，
+        //     于是「谁盖住目标窗口，就一起盖住它的红框」。
+        let prev = GetWindow(target, GW_HWNDPREV).unwrap_or_default();
+        if prev.0 != overlay.0 {
+            let now = GetTickCount() as i32;
+            if f.last_z_tick == UNSET || now.wrapping_sub(f.last_z_tick) >= Z_FIX_MS {
+                f.last_z_tick = now;
+                let _ = SetWindowPos(
+                    overlay,
+                    Some(target),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
         }
     }
 }
@@ -475,8 +525,10 @@ fn apply_region(overlay: HWND, w: i32, h: i32, th: i32) {
 
 unsafe fn create_overlay() -> Result<HWND> {
     let hmodule = GetModuleHandleW(None)?;
+    // 注意：**不要**带 WS_EX_TOPMOST。置顶与否由 refresh_entry 按目标窗口的状态动态决定，
+    // 否则同时标记多个窗口时所有红框都会浮在最上层，遮挡关系错乱。
     let ex_style: WINDOW_EX_STYLE =
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
     let style: WINDOW_STYLE = WS_POPUP;
     Ok(CreateWindowExW(
         ex_style,
