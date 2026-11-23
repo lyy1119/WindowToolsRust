@@ -5,7 +5,7 @@
 一个类似 [WindowTop](https://github.com/WindowTop/WindowTop-App) 的轻量替代品。
 界面用纯 Rust 的 `egui` 画，Windows 原生能力走 `windows-rs`，**不注入任何目标进程**。
 
-`v1.0.1` · Windows 10/11（x64 / ARM64）· MIT License
+`v1.0.2` · Windows 10/11（x64 / ARM64）· MIT License
 
 ---
 
@@ -54,8 +54,8 @@
 
 | 平台 | 文件名 |
 |---|---|
-| Windows x64 | `WindowToolsRust-v1.0.1_windows-x86-64.exe` |
-| Windows ARM64 | `WindowToolsRust-v1.0.1_windows-arm64.exe` |
+| Windows x64 | `WindowToolsRust-v1.0.2_windows-x86-64.exe` |
+| Windows ARM64 | `WindowToolsRust-v1.0.2_windows-arm64.exe` |
 
 命名规则：`WindowToolsRust-<版本>_windows-<架构>.exe`。
 
